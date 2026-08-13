@@ -1,0 +1,122 @@
+{
+  "EBU R128": {
+    "lufs_target": -23.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "European broadcast standard (TV, radio). Target -23 LUFS ±2 dB, Phase Correlation >= 0.3"
+  },
+  "EBU R128 S1 (Streaming)": {
+    "lufs_target": -16.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "EBU R128 for streaming (Spotify, Tidal). Target -16 LUFS, Phase Correlation >= 0.3"
+  },
+  "EBU R128 S2 (Podcast)": {
+    "lufs_target": -18.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "EBU R128 S2 for podcast/audiobook. Target -18 LUFS, Phase Correlation >= 0.3"
+  },
+  "Podcast (Generic)": {
+    "lufs_target": -18.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "Generic podcast target. -16 to -20 LUFS, Phase Correlation >= 0.3"
+  },
+  "AES71 (Portable Devices)": {
+    "lufs_target": -16.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "AES71-2018 for portable devices. Target -16 LUFS, Phase Correlation >= 0.3"
+  },
+  "YouTube": {
+    "lufs_target": -14.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "YouTube normalizes to -14 LUFS. Phase Correlation >= 0.3 recommended"
+  },
+  "Spotify": {
+    "lufs_target": -14.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "Spotify Loud normalizes to -14 LUFS. Phase Correlation >= 0.3"
+  },
+  "Apple Music / iTunes": {
+    "lufs_target": -16.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "Apple Sound Check normalizes to -16 LUFS. Phase Correlation >= 0.3"
+  },
+  "Amazon Music": {
+    "lufs_target": -14.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "Amazon Music normalizes to -14 LUFS. Phase Correlation >= 0.3"
+  },
+  "Netflix": {
+    "lufs_target": -27.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "Netflix dialogue-anchored. Target ~ -27 LUFS dialogue, Phase Correlation >= 0.3"
+  },
+  "ATSC A/85 (USA Broadcast)": {
+    "lufs_target": -24.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "USA/Canada broadcast standard. Target -24 LKFS ±2 dB, Phase Correlation >= 0.3"
+  },
+  "ARIB TR-B32 (Japan)": {
+    "lufs_target": -24.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "Japanese broadcast standard. Target -24 LUFS, Phase Correlation >= 0.3"
+  },
+  "ETSI TS 102 366 (DVB)": {
+    "lufs_target": -23.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "DVB standard for digital video broadcasting. Target -23 LUFS, Phase Correlation >= 0.3"
+  },
+  "AES77 (Cinema)": {
+    "lufs_target": -24.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "AES77 for digital cinema. Target -24 LUFS, Phase Correlation >= 0.3"
+  },
+  "ISO/IEC 23003-4 (MPEG-H)": {
+    "lufs_target": -24.0,
+    "lufs_tolerance": 2.0,
+    "lufs_warning": 3.0,
+    "corr_warning": 0.3,
+    "corr_critical": 0.0,
+    "description": "MPEG-H 3D Audio loudness. Target -24 LUFS, Phase Correlation >= 0.3"
+  }
+}

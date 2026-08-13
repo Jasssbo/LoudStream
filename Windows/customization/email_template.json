@@ -1,0 +1,4 @@
+{
+  "subject": "[LoudStream] Issue with stream: {stream_name}",
+  "body": "Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n"
+}
