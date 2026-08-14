@@ -49,7 +49,7 @@ LoudStream/
 │   │   ├── presets/Default.csv   # Preset file for IP + Name sets with single-click recall
 │   │   └── email_template.json  # The email template for customizable technical support communications 
 │   └── ffmpeg_bin/                 # FFmpeg binaries for InnoSetup's packaging
-|       ├── ffmpeg.exe         #downloadable from https://ffmpeg.org/download.html
+|       ├── ffmpeg.exe        # downloadable from https://ffmpeg.org/download.html
 |       └── ffplay.exe        # downloadable from https://ffmpeg.org/download.html
 └── README.md
 ```

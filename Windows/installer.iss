@@ -7,6 +7,7 @@
 ; basta che dist\ e ffmpeg_bin\ siano nella stessa cartella del .iss
 #define SourceApp SourcePath + "dist\LoudStream"
 #define SourceFfmpeg SourcePath + "ffmpeg_bin"
+#define SourceIcons SourcePath + "\icons"
 
 [Setup]
 AppId={{B73015F5-B54B-41C0-AAD1-7748A105639C}
@@ -21,7 +22,7 @@ AppUpdatesURL=https://github.com/Jasssbo/LoudStream/releases
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 UninstallDisplayName={#MyAppName}
-UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayIcon={#SourceIcons}\LoudStream.ico
 
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
@@ -31,6 +32,7 @@ MinVersion=10.0
 ; Output nella cartella Output\ accanto al .iss — relativo e automatico
 OutputDir={#SourcePath}Output
 OutputBaseFilename=LoudStream_installer
+SetupIconFile={#SourceIcons}\LoudStream.ico
 
 ; License agreement - user must accept before installing
 LicenseFile={#SourcePath}\LICENSE

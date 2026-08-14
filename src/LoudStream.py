@@ -2436,7 +2436,7 @@ class MainWindow(QMainWindow):
         left_col = QVBoxLayout()
         left_col.setSpacing(1)
 
-        title = QLabel("LoudStream v4.1")
+        title = QLabel("LoudStream v1.0")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-family: 'Courier New'; font-weight: bold; letter-spacing: 2px;")
 
         # Author attribution
