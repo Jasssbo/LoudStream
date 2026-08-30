@@ -20,12 +20,13 @@ Visualizza fino a 16 flussi audio contemporaneamente con waveform e analizzatore
 
 ## 🏛 Architettura e Performance
 
-Per monitorare fino a 16 stream stereo contemporaneamente in tempo reale senza causare blocchi dell'interfaccia grafica (GUI) o problemi di concorrenza del Global Interpreter Lock (GIL) di Python, LoudStream implementa un'architettura **disaccoppiata ispirata alle DAW professionali**:
+Per monitorare fino a 16 stream stereo contemporaneamente in tempo reale senza causare blocchi dell'interfaccia grafica (GUI) o problemi di concorrenza del Global Interpreter Lock (GIL) di Python, LoudStream implementa un'architettura altamente ottimizzata **disaccoppiata e ispirata alle DAW professionali**:
 
-* **Thread DSP di Background (Audio Engine)**: Ogni stream card avvia un thread di background dedicato ([StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/LoudStream.py#L407)). Questo worker legge il flusso PCM grezzo da FFmpeg, applica i filtri di ponderazione K in modo incrementale (filtri IIR biquad che mantengono lo stato `zi` tra i vari chunk), aggiorna i ring buffer e calcola la FFT.
-* **Limitazione del refresh UI (Rate Throttling)**: I thread di background disaccoppiano la frequenza di calcolo da quella di rendering della GUI. Invece di inviare segnali continui a PyQt per ogni pacchetto audio, limitano le notifiche UI a esattamente 20 aggiornamenti al secondo (50ms).
-* **GUI Thread a "Zero Calcoli"**: Il thread principale della GUI non esegue calcoli matematici, ridimensionamenti o FFT. Riceve semplicemente i dati visuali pre-calcolati e li disegna tramite curve veloci e accelerate.
+* **C-Bindings Nativi (PyAV)**: Demuxing e decodifica audio sono gestiti interamente in C da PyAV, aggirando il GIL di Python ed eliminando l'overhead dei canali `subprocess`. I flussi nativamente a 48kHz stereo s16 bypassano automaticamente il resampler (`swr_convert`) per risparmiare preziosi cicli CPU.
+* **DSP a "Zero-Allocazioni"**: Ogni stream avvia un thread dedicato ([StreamWorker](src/LoudStream.py)) che alimenta direttamente ring-buffer circolari NumPy pre-allocati in memoria. Utilizzando calcoli in-place (`np.abs(out=)`) e finestre LUFS $O(1)$ su deque, il sistema previene la frammentazione della memoria ed evita completamente i freeze ("stop-the-world") causati dal Garbage Collector di Python.
+* **Limitazione del refresh UI (Rate Throttling)**: I thread di background disaccoppiano la frequenza di calcolo da quella di rendering della GUI. La matematica DSP è limitata (LUFS a 2 FPS, FFT a 5 FPS). Il thread principale (GUI) non esegue calcoli: riceve viste di array leggere e protette da lock e le disegna tramite curve PyQtGraph con accelerazione hardware.
 * **Misurazione conforme agli Standard**: Il valore LUFS viene calcolato come RMS ponderato K non filtrato (ungated) su un buffer scorrevole di 3 secondi, conforme alle specifiche EBU R128 e ITU-R BS.1770-4 per la loudness Short-term.
+* **Motore di Allerta Robusto**: Un demone in background coordina gli avvisi automatici (SMTP) di Silenzio e Disconnessione su più istanze tramite un sistema di file-lock Inter-Process. Dispone di una configurazione JSON a doppio strato che assicura che le impostazioni di default non vengano mai sovrascritte dai preset dell'utente.
 
 ---
 
@@ -44,9 +45,10 @@ LoudStream/
 │   ├── installer.iss               # Script Inno Setup
 │   ├── customization/
 │   │   ├── metering_standards/standards.json   # File per richiamare gli standard di misurazione
-│   │   ├── presets/Default.csv   # File per richiamare set di IP + Nome corrisponente + email supporto tecnico
-│   │   └── email_template.json  # File per personalizzare il Template della Email da inviare al supporto tecnico dello stream corrispondente
-│   └── ffmpeg_bin/             # Binari FFMPEG per packaging con InnoSetup
+│   │   ├── presets/Default.csv                 # File per richiamare set di IP + Nome corrisponente + email supporto tecnico
+│   │   ├── email_template.default.json         # Configurazione predefinita di sola lettura per gli alert SMTP
+│   │   └── email_template.json                 # File utente per personalizzare le impostazioni degli alert SMTP e le email
+│   └── ffmpeg_bin/                             # Binari FFMPEG per packaging con InnoSetup
 |       ├── ffmpeg.exe       # scaricabile da https://ffmpeg.org/download.html
 |       └── ffplay.exe       # scaricabile da https://ffmpeg.org/download.html
 └── README.md

@@ -151,7 +151,7 @@ else:
 # UI and metering constants
 WAVEFORM_HISTORY = 2048       # samples in waveform display
 LUFS_SHORTTERM_SEC = 3.0      # 3 seconds - Short-term loudness
-SPECTRUM_UPDATE_INTERVAL = 0.10  # seconds between spectrum FFT updates (10 fps)
+SPECTRUM_UPDATE_INTERVAL = 0.20  # seconds between spectrum FFT updates (5 fps)
 LUFS_UPDATE_INTERVAL     = 0.50  # seconds between LUFS/TP computations (2 per sec)
 
 # ── Current Configuration ───────────────────────────────────────────────────
@@ -703,17 +703,24 @@ class StreamWorker(QObject):
         n_blocks = n_frames // block_size
         
         if n_blocks > 0:
-            truncated = stereo[:n_blocks * block_size]
-            reshaped = truncated.reshape(n_blocks, block_size, 2)
-            peaks = np.max(np.abs(reshaped), axis=1)
+            # Re-use the existing float32 arrays (chunk_l, chunk_r) instead of allocating new np.abs() arrays
+            tr_l = chunk_l[:n_blocks * block_size].reshape(n_blocks, block_size)
+            tr_r = chunk_r[:n_blocks * block_size].reshape(n_blocks, block_size)
+            
+            # In-place absolute value
+            np.abs(tr_l, out=tr_l)
+            np.abs(tr_r, out=tr_r)
+            
+            peaks_l = np.max(tr_l, axis=1)
+            peaks_r = np.max(tr_r, axis=1)
             
             env_l = np.empty(2 * n_blocks, dtype=np.float32)
-            env_l[0::2] = peaks[:, 0]
-            env_l[1::2] = -peaks[:, 0]
+            env_l[0::2] = peaks_l
+            env_l[1::2] = -peaks_l
             
             env_r = np.empty(2 * n_blocks, dtype=np.float32)
-            env_r[0::2] = peaks[:, 1]
-            env_r[1::2] = -peaks[:, 1]
+            env_r[0::2] = peaks_r
+            env_r[1::2] = -peaks_r
         else:
             env_l = np.zeros(2, dtype=np.float32)
             env_r = np.zeros(2, dtype=np.float32)
@@ -885,9 +892,10 @@ class StreamWorker(QObject):
                 self._safe_emit(self.status_signal, "live")
                 self._retry_count = 0  # Reset retry counter on successful connection
                 
-                accumulated_samples = []
-                accumulated_size = 0
                 target_size = int(2 * native_rate * 0.1)  # 100ms of stereo samples
+                target_size += target_size % 2
+                acc_buf = np.empty(target_size + 96000, dtype=np.int16)
+                acc_idx = 0
                 
                 # Decode packets and feed samples chunk-by-chunk to the DSP pipeline
                 try:
@@ -900,19 +908,36 @@ class StreamWorker(QObject):
                                 if self._stop_event.is_set() or not self._alive:
                                     del frame
                                     break
-                                resampled_frames = resampler.resample(frame)
+                                
+                                is_native = (
+                                    frame.format.name == 's16' and 
+                                    frame.sample_rate == native_rate and 
+                                    frame.layout.name == 'stereo'
+                                )
+                                
+                                if is_native:
+                                    resampled_frames = [frame]
+                                else:
+                                    resampled_frames = resampler.resample(frame)
+                                    
                                 for resampled in resampled_frames:
                                     samples = resampled.to_ndarray()[0]
-                                    accumulated_samples.append(samples)
-                                    accumulated_size += len(samples)
+                                    n_s = len(samples)
                                     
-                                    if accumulated_size >= target_size:
-                                        chunk = np.concatenate(accumulated_samples)
-                                        self._process_chunk(chunk)
-                                        accumulated_samples = []
-                                        accumulated_size = 0
-                                    del resampled
-                                del resampled_frames
+                                    if acc_idx + n_s > len(acc_buf):
+                                        acc_buf = np.resize(acc_buf, acc_idx + n_s + target_size)
+                                        
+                                    acc_buf[acc_idx:acc_idx + n_s] = samples
+                                    acc_idx += n_s
+                                    
+                                    if acc_idx >= target_size:
+                                        self._process_chunk(acc_buf[:acc_idx])
+                                        acc_idx = 0
+                                        
+                                    if not is_native:
+                                        del resampled
+                                if not is_native:
+                                    del resampled_frames
                                 del frame
                         except av.AVError:
                             # Skip corrupted/missing frames silently (just like standard FFmpeg)
@@ -927,12 +952,17 @@ class StreamWorker(QObject):
                     resampled_frames = resampler.resample(None)
                     for resampled in resampled_frames:
                         samples = resampled.to_ndarray()[0]
-                        accumulated_samples.append(samples)
+                        n_s = len(samples)
+                        if acc_idx + n_s > len(acc_buf):
+                            acc_buf = np.resize(acc_buf, acc_idx + n_s + target_size)
+                        acc_buf[acc_idx:acc_idx + n_s] = samples
+                        acc_idx += n_s
                         del resampled
                     del resampled_frames
-                    if accumulated_samples:
-                        chunk = np.concatenate(accumulated_samples)
-                        self._process_chunk(chunk)
+                    
+                    if acc_idx > 0:
+                        self._process_chunk(acc_buf[:acc_idx])
+                        acc_idx = 0
                         
             except Exception as e:
                 self._retry_count += 1
@@ -3031,11 +3061,10 @@ class MainWindow(QMainWindow):
             if card.isVisible():
                 card.refresh_display(now, std)
 
-        # Periodic maintenance sweep (every 60 seconds) to clear Qt graphics caches and free Python heap arenas
+        # Periodic maintenance sweep (every 60 seconds) to clear Qt graphics caches
         if now - self._last_gc_sweep >= 60.0:
             self._last_gc_sweep = now
             QPixmapCache.clear()
-            gc.collect()
 
     def _show_options(self):
         """Mostra il dialog delle opzioni."""

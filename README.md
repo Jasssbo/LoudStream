@@ -22,12 +22,13 @@ Monitor up to 16 audio streams simultaneously with real-time **waveform**, **L/R
 
 ## 🏛 Architecture & Performance
 
-To monitor up to 16 stereo streams simultaneously in real-time without GUI freezing or global interpreter lock (GIL) thread contention, LoudStream implements a professional **DAW-inspired decoupled architecture**:
+To monitor up to 16 stereo streams simultaneously in real-time without GUI freezing or global interpreter lock (GIL) thread contention, LoudStream implements a highly optimized, professional **DAW-inspired decoupled architecture**:
 
-* **DSP Worker Threads (Audio Engine)**: Every stream card spawns a dedicated background thread ([StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/LoudStream.py#L407)). This worker reads raw PCM from FFmpeg, applies stateful K-weighting filters (biquad IIR filters carrying state vectors `zi` across chunks), updates raw and pre-filtered ring buffers, and runs short-term FFTs.
-* **UI Rate Throttling**: Background threads decouple their computation rate from the GUI rendering rate. Instead of flooding PyQt with signals on every packet, they throttle UI signal emissions to exactly 20 updates per second (50ms).
-* **Zero-Math GUI Thread**: The main thread does zero DSP math, windowing, or filtering. It simply takes the lightweight pre-computed visual payloads and draws them using fast, hardware-accelerated curves.
+* **Native C-Bindings (PyAV)**: Audio demuxing and decoding are handled by PyAV (FFmpeg C-bindings), completely bypassing Python's GIL and avoiding raw `subprocess` pipe overhead. Streams natively matching 48kHz stereo s16 automatically bypass the resampler entirely (`swr_convert`) to save CPU cycles.
+* **Zero-Allocation DSP Pipeline**: Every stream spawns a dedicated background thread ([StreamWorker](src/LoudStream.py)) that feeds direct memory-mapped NumPy circular buffers. By using in-place operations (`np.abs(out=)`) and $O(1)$ deque LUFS windows, it prevents memory fragmentation and avoids "stop-the-world" Python Garbage Collection (GC) pauses.
+* **UI Rate Throttling & Pre-computation**: Background threads decouple their computation rate from the GUI rendering rate. DSP math (LUFS at 2 FPS, FFT at 5 FPS) is heavily throttled. The main thread does zero DSP math; it simply takes lightweight, lock-protected payload views and draws them using hardware-accelerated PyQtGraph curves.
 * **Standard-Compliant Metering**: LUFS is computed as K-weighted ungated RMS over sliding 3-second buffers, fully compliant with EBU R128 and ITU-R BS.1770-4 Short-term loudness specifications.
+* **Robust Alerting Engine**: A background daemon coordinates Automated Silence & Stream-Down alerts across multiple instances via Inter-Process file locks. It features a dual-layer JSON config system ensuring factory defaults are never overwritten by user settings.
 
 ---
 
@@ -46,9 +47,10 @@ LoudStream/
 │   ├── installer.iss               # Inno Setup script
 │   ├── customization/
 │   │   ├── metering_standards/standards.json   # Metering standards configuration
-│   │   ├── presets/Default.csv   # Preset file for IP + Name sets with single-click recall
-│   │   └── email_template.json  # The email template for customizable technical support communications 
-│   └── ffmpeg_bin/                 # FFmpeg binaries for InnoSetup's packaging
+│   │   ├── presets/Default.csv                 # Preset file for IP + Name sets with single-click recall
+│   │   ├── email_template.default.json         # Factory default read-only SMTP alert configuration
+│   │   └── email_template.json                 # User-editable email template and configuration overrides
+│   └── ffmpeg_bin/                             # FFmpeg binaries for InnoSetup's packaging
 |       ├── ffmpeg.exe        # downloadable from https://ffmpeg.org/download.html
 |       └── ffplay.exe        # downloadable from https://ffmpeg.org/download.html
 └── README.md
