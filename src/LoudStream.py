@@ -217,63 +217,80 @@ _CUSTOMIZATION_DIR = _BASE_DIR / "customization"
 
 
 # ── Email template & alert persistence ───────────────────────────────────────────────
-_EMAIL_TEMPLATE_FILE = _CUSTOMIZATION_DIR / "email_template.json"
+# Two-file settings pattern:
+#   email_template.default.json  — factory defaults, shipped with the app, NEVER written by the app
+#   email_template.json          — user file, created on first Apply, always loaded in preference
+_EMAIL_TEMPLATE_DEFAULT = _CUSTOMIZATION_DIR / "email_template.default.json"
+_EMAIL_TEMPLATE_USER    = _CUSTOMIZATION_DIR / "email_template.json"
+
+def _apply_template_data(data: dict):
+    """Apply a parsed settings dict onto CONFIG."""
+    CONFIG.email_subject          = data.get("subject",                  CONFIG.email_subject)
+    CONFIG.email_body             = data.get("body",                     CONFIG.email_body)
+    CONFIG.silence_alerts_enabled = data.get("silence_alerts_enabled",   CONFIG.silence_alerts_enabled)
+    CONFIG.silence_threshold_lufs = float(data.get("silence_threshold_lufs", CONFIG.silence_threshold_lufs))
+    CONFIG.silence_alert_mins     = float(data.get("silence_alert_mins",     CONFIG.silence_alert_mins))
+    CONFIG.alert_cooldown_mins    = float(data.get("alert_cooldown_mins",    CONFIG.alert_cooldown_mins))
+    CONFIG.global_alert_email     = data.get("global_alert_email",       CONFIG.global_alert_email)
+    CONFIG.smtp_enabled           = data.get("smtp_enabled",             CONFIG.smtp_enabled)
+    CONFIG.smtp_host              = data.get("smtp_host",                CONFIG.smtp_host)
+    CONFIG.smtp_port              = int(data.get("smtp_port",            CONFIG.smtp_port))
+    CONFIG.smtp_user              = data.get("smtp_user",                CONFIG.smtp_user)
+    CONFIG.smtp_pass              = data.get("smtp_pass",                CONFIG.smtp_pass)
+    CONFIG.smtp_tls               = data.get("smtp_tls",                 CONFIG.smtp_tls)
+    CONFIG.alert_subject          = data.get("alert_subject",            CONFIG.alert_subject)
+    CONFIG.alert_body             = data.get("alert_body",               CONFIG.alert_body)
+    CONFIG.recovery_subject       = data.get("recovery_subject",         CONFIG.recovery_subject)
+    CONFIG.recovery_body          = data.get("recovery_body",            CONFIG.recovery_body)
 
 def _load_email_template():
-    """Load email template and alert configuration from JSON file if it exists."""
-    try:
-        if _EMAIL_TEMPLATE_FILE.exists():
-            with open(_EMAIL_TEMPLATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            CONFIG.email_subject = data.get("subject", CONFIG.email_subject)
-            CONFIG.email_body = data.get("body", CONFIG.email_body)
-            CONFIG.silence_alerts_enabled = data.get("silence_alerts_enabled", CONFIG.silence_alerts_enabled)
-            CONFIG.silence_threshold_lufs = float(data.get("silence_threshold_lufs", CONFIG.silence_threshold_lufs))
-            CONFIG.silence_alert_mins = float(data.get("silence_alert_mins", CONFIG.silence_alert_mins))
-            CONFIG.alert_cooldown_mins = float(data.get("alert_cooldown_mins", CONFIG.alert_cooldown_mins))
-            CONFIG.global_alert_email = data.get("global_alert_email", CONFIG.global_alert_email)
-            CONFIG.smtp_enabled = data.get("smtp_enabled", CONFIG.smtp_enabled)
-            CONFIG.smtp_host = data.get("smtp_host", CONFIG.smtp_host)
-            CONFIG.smtp_port = int(data.get("smtp_port", CONFIG.smtp_port))
-            CONFIG.smtp_user = data.get("smtp_user", CONFIG.smtp_user)
-            CONFIG.smtp_pass = data.get("smtp_pass", CONFIG.smtp_pass)
-            CONFIG.smtp_tls = data.get("smtp_tls", CONFIG.smtp_tls)
-            CONFIG.alert_subject = data.get("alert_subject", CONFIG.alert_subject)
-            CONFIG.alert_body = data.get("alert_body", CONFIG.alert_body)
-            CONFIG.recovery_subject = data.get("recovery_subject", CONFIG.recovery_subject)
-            CONFIG.recovery_body = data.get("recovery_body", CONFIG.recovery_body)
-            print(f"[Email Template] Loaded from {_EMAIL_TEMPLATE_FILE}")
-    except Exception as e:
-        print(f"[Email Template] Could not load: {e}")
+    """Load settings. Priority: user file → default file → hard-coded defaults."""
+    # 1. Try loading the default file first (base layer)
+    if _EMAIL_TEMPLATE_DEFAULT.exists():
+        try:
+            with open(_EMAIL_TEMPLATE_DEFAULT, "r", encoding="utf-8") as f:
+                _apply_template_data(json.load(f))
+            print(f"[Settings] Default loaded from {_EMAIL_TEMPLATE_DEFAULT}")
+        except Exception as e:
+            print(f"[Settings] Could not load default file: {e}")
+
+    # 2. Apply user file on top (overrides defaults)
+    if _EMAIL_TEMPLATE_USER.exists():
+        try:
+            with open(_EMAIL_TEMPLATE_USER, "r", encoding="utf-8") as f:
+                _apply_template_data(json.load(f))
+            print(f"[Settings] User overrides loaded from {_EMAIL_TEMPLATE_USER}")
+        except Exception as e:
+            print(f"[Settings] Could not load user file: {e}")
 
 def _save_email_template():
-    """Save email template and alert configuration to JSON file."""
+    """Save current settings to the USER file only. The default file is never modified."""
     try:
         _CUSTOMIZATION_DIR.mkdir(parents=True, exist_ok=True)
         data = {
-            "subject": CONFIG.email_subject,
-            "body": CONFIG.email_body,
+            "subject":                 CONFIG.email_subject,
+            "body":                    CONFIG.email_body,
             "silence_alerts_enabled": CONFIG.silence_alerts_enabled,
             "silence_threshold_lufs": CONFIG.silence_threshold_lufs,
-            "silence_alert_mins": CONFIG.silence_alert_mins,
-            "alert_cooldown_mins": CONFIG.alert_cooldown_mins,
-            "global_alert_email": CONFIG.global_alert_email,
-            "smtp_enabled": CONFIG.smtp_enabled,
-            "smtp_host": CONFIG.smtp_host,
-            "smtp_port": CONFIG.smtp_port,
-            "smtp_user": CONFIG.smtp_user,
-            "smtp_pass": CONFIG.smtp_pass,
-            "smtp_tls": CONFIG.smtp_tls,
-            "alert_subject": CONFIG.alert_subject,
-            "alert_body": CONFIG.alert_body,
-            "recovery_subject": CONFIG.recovery_subject,
-            "recovery_body": CONFIG.recovery_body
+            "silence_alert_mins":     CONFIG.silence_alert_mins,
+            "alert_cooldown_mins":    CONFIG.alert_cooldown_mins,
+            "global_alert_email":     CONFIG.global_alert_email,
+            "smtp_enabled":           CONFIG.smtp_enabled,
+            "smtp_host":              CONFIG.smtp_host,
+            "smtp_port":              CONFIG.smtp_port,
+            "smtp_user":              CONFIG.smtp_user,
+            "smtp_pass":              CONFIG.smtp_pass,
+            "smtp_tls":               CONFIG.smtp_tls,
+            "alert_subject":          CONFIG.alert_subject,
+            "alert_body":             CONFIG.alert_body,
+            "recovery_subject":       CONFIG.recovery_subject,
+            "recovery_body":          CONFIG.recovery_body
         }
-        with open(_EMAIL_TEMPLATE_FILE, "w", encoding="utf-8") as f:
+        with open(_EMAIL_TEMPLATE_USER, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"[Email Template] Saved to {_EMAIL_TEMPLATE_FILE}")
+        print(f"[Settings] User settings saved to {_EMAIL_TEMPLATE_USER}")
     except Exception as e:
-        print(f"[Email Template] Could not save: {e}")
+        print(f"[Settings] Could not save user file: {e}")
 
 # Load saved email template at startup
 _load_email_template()
@@ -1636,18 +1653,28 @@ class OptionsDialog(QDialog):
         self._analyze_slider.setValue(1000)
         self._refresh_slider.setValue(50)
         self._smooth_slider.setValue(4)
-        # Reset metering standard a EBU R128
+        # Reset metering standard to EBU R128
         idx = list(METERING_STANDARDS.keys()).index("EBU R128")
         self._metering_combo.setCurrentIndex(idx)
+
+        # Load factory defaults from the default file (if available)
+        defaults = {}
+        if _EMAIL_TEMPLATE_DEFAULT.exists():
+            try:
+                with open(_EMAIL_TEMPLATE_DEFAULT, "r", encoding="utf-8") as f:
+                    defaults = json.load(f)
+            except Exception:
+                pass
+
         # Reset email template
-        self._email_subject.setText("[LoudStream] Issue with stream: {stream_name}")
-        self._email_body.setPlainText("Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n")
-        # Reset alert defaults
-        self._alerts_enabled_chk.setChecked(True)
-        self._silence_thresh_spin.setValue(-60)
-        self._alert_mins_spin.setValue(10)
-        self._cooldown_mins_spin.setValue(60)
-        self._smtp_enabled_chk.setChecked(False)
+        self._email_subject.setText(defaults.get("subject", "[LoudStream] Issue with stream: {stream_name}"))
+        self._email_body.setPlainText(defaults.get("body", "Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n"))
+        # Reset alert settings from default file
+        self._alerts_enabled_chk.setChecked(bool(defaults.get("silence_alerts_enabled", True)))
+        self._silence_thresh_spin.setValue(int(defaults.get("silence_threshold_lufs", -60)))
+        self._alert_mins_spin.setValue(int(defaults.get("silence_alert_mins", 10)))
+        self._cooldown_mins_spin.setValue(int(defaults.get("alert_cooldown_mins", 60)))
+        self._smtp_enabled_chk.setChecked(bool(defaults.get("smtp_enabled", False)))
 
     def _test_smtp_connection(self):
         to_email = self._global_email_edit.text().strip()
@@ -2157,6 +2184,79 @@ class StreamCard(QFrame):
         if worker is None:
             return
 
+        # ── Silence & Stream-Down Automated Email Alert Engine ──
+        # IMPORTANT: This must run BEFORE the _ui_data_dirty early-return guard.
+        # When a stream is disconnected, no audio data arrives so the dirty flag
+        # is never set and the function would return early — permanently skipping
+        # alert detection. We use self._last_lufs_display as the cached LUFS value
+        # (it retains the last known reading; -999.0 when stream has no audio).
+        if CONFIG.silence_alerts_enabled:
+            lufs_for_alert = self._last_lufs_display  # -999.0 when stream is silent/down
+            is_down = (self._status in ("connecting", "stopped")) or (lufs_for_alert <= CONFIG.silence_threshold_lufs)
+
+            if is_down:
+                if self._down_start_time is None:
+                    self._down_start_time = current_time
+                    self._down_reason = "Stream Disconnected" if self._status in ("connecting", "stopped") else f"Audio Silence (LUFS <= {CONFIG.silence_threshold_lufs:.1f} dBFS)"
+
+                down_duration_sec = current_time - self._down_start_time
+                threshold_sec = CONFIG.silence_alert_mins * 60.0
+
+                if down_duration_sec >= threshold_sec and not self._alert_sent:
+                    self._alert_sent = True
+                    stream_name = self._custom_name or self._short_url()
+                    alert_key = f"{stream_name}_{self.url}"
+                    self._last_alert_key = alert_key
+                    recipient = self._email or CONFIG.global_alert_email
+                    dur_mins = int(down_duration_sec // 60)
+                    dur_str = f"{dur_mins} minute(s)"
+                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                    reason = self._down_reason
+
+                    subject = CONFIG.alert_subject.format(
+                        stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
+                    )
+                    body = CONFIG.alert_body.format(
+                        stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
+                    )
+
+                    # Dispatch via background daemon thread with multi-instance lock & jitter (0 GUI blocking!)
+                    def _dispatch_alert_worker():
+                        import random
+                        time.sleep(random.uniform(0.05, 0.25))
+                        cooldown_sec = CONFIG.alert_cooldown_mins * 60.0
+                        if not AlertLockManager.is_alert_recent(alert_key, cooldown_sec):
+                            AlertLockManager.record_alert(alert_key)
+                            print(f"[Alert Triggered] Stream '{stream_name}' DOWN for {dur_str} ({reason}). Dispatching SMTP alert...")
+                            send_smtp_email_async(recipient, subject, body)
+                        else:
+                            print(f"[Alert Suppressed] Alert for stream '{stream_name}' already dispatched by sister LoudStream instance.")
+
+                    threading.Thread(target=_dispatch_alert_worker, daemon=True).start()
+            else:
+                # Stream is live and audio is normal
+                if self._alert_sent and self._last_alert_key:
+                    stream_name = self._custom_name or self._short_url()
+                    recipient = self._email or CONFIG.global_alert_email
+                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                    AlertLockManager.clear_alert(self._last_alert_key)
+
+                    subject = CONFIG.recovery_subject.format(
+                        stream_name=stream_name, stream_url=self.url, time=now_str
+                    )
+                    body = CONFIG.recovery_body.format(
+                        stream_name=stream_name, stream_url=self.url, time=now_str
+                    )
+
+                    print(f"[Recovery Triggered] Stream '{stream_name}' RECOVERED. Dispatching SMTP recovery email...")
+                    send_smtp_email_async(recipient, subject, body)
+
+                    self._alert_sent = False
+                    self._last_alert_key = ""
+
+                self._down_start_time = None
+
         with worker._state_lock:
             if not worker._ui_data_dirty:
                 return
@@ -2219,72 +2319,7 @@ class StreamCard(QFrame):
             self._corr_label.setStyleSheet(
                 f"color: {corr_color}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
 
-        # ── Silence & Stream-Down Automated Email Alert Engine ──
-        if CONFIG.silence_alerts_enabled:
-            is_down = (self._status in ("connecting", "stopped")) or (lufs <= CONFIG.silence_threshold_lufs)
-            
-            if is_down:
-                if self._down_start_time is None:
-                    self._down_start_time = current_time
-                    self._down_reason = "Stream Disconnected" if self._status in ("connecting", "stopped") else f"Audio Silence (LUFS <= {CONFIG.silence_threshold_lufs:.1f} dBFS)"
-                    
-                down_duration_sec = current_time - self._down_start_time
-                threshold_sec = CONFIG.silence_alert_mins * 60.0
-                
-                if down_duration_sec >= threshold_sec and not self._alert_sent:
-                    self._alert_sent = True
-                    stream_name = self._custom_name or self._short_url()
-                    alert_key = f"{stream_name}_{self.url}"
-                    self._last_alert_key = alert_key
-                    recipient = self._email or CONFIG.global_alert_email
-                    dur_mins = int(down_duration_sec // 60)
-                    dur_str = f"{dur_mins} minute(s)"
-                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-                    reason = self._down_reason
-                    
-                    subject = CONFIG.alert_subject.format(
-                        stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
-                    )
-                    body = CONFIG.alert_body.format(
-                        stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
-                    )
-                    
-                    # Dispatch via background daemon thread with multi-instance lock & jitter (0 GUI blocking!)
-                    def _dispatch_alert_worker():
-                        import random
-                        time.sleep(random.uniform(0.05, 0.25))
-                        cooldown_sec = CONFIG.alert_cooldown_mins * 60.0
-                        if not AlertLockManager.is_alert_recent(alert_key, cooldown_sec):
-                            AlertLockManager.record_alert(alert_key)
-                            print(f"[Alert Triggered] Stream '{stream_name}' DOWN for {dur_str} ({reason}). Dispatching SMTP alert...")
-                            send_smtp_email_async(recipient, subject, body)
-                        else:
-                            print(f"[Alert Suppressed] Alert for stream '{stream_name}' already dispatched by sister LoudStream instance.")
-                            
-                    threading.Thread(target=_dispatch_alert_worker, daemon=True).start()
-            else:
-                # Stream is live and audio is normal
-                if self._alert_sent and self._last_alert_key:
-                    stream_name = self._custom_name or self._short_url()
-                    recipient = self._email or CONFIG.global_alert_email
-                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    AlertLockManager.clear_alert(self._last_alert_key)
-                    
-                    subject = CONFIG.recovery_subject.format(
-                        stream_name=stream_name, stream_url=self.url, time=now_str
-                    )
-                    body = CONFIG.recovery_body.format(
-                        stream_name=stream_name, stream_url=self.url, time=now_str
-                    )
-                    
-                    print(f"[Recovery Triggered] Stream '{stream_name}' RECOVERED. Dispatching SMTP recovery email...")
-                    send_smtp_email_async(recipient, subject, body)
-                    
-                    self._alert_sent = False
-                    self._last_alert_key = ""
-                
-                self._down_start_time = None
+
 
 
 # ── Filtro eventi Windows per rilevare sblocco sessione ───────────────────────
