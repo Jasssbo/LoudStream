@@ -1,5 +1,5 @@
 """
-LoudStream v4.1
+LoudStream v1.0
 MIT License
 Copyright (c) 2026 Andrea Mazzurana
 
@@ -27,17 +27,19 @@ Displays real-time waveform, LUFS short-term (~3s), stereo phase
 correlation, and frequency spectrum (20Hz-20kHz) per stream.
 
 Dependencies:
-    pip install PyQt6 pyqtgraph numpy pyloudnorm
+    pip install PyQt6 pyqtgraph numpy scipy pyloudnorm av
 
 System requirements:
-    - ffmpeg installed and in PATH
+    - ffplay installed and in PATH (for audio preview)
 
 Usage:
     python LoudStream.py
     Then add stream URLs from the GUI or write a CSV preset.
 """
 
-import sys, threading, gc, subprocess, re, csv, json, time, math, atexit, platform, shutil, ctypes, webbrowser, argparse
+import os, sys, threading, subprocess, re, csv, json, time, math, random, smtplib, urllib.parse, atexit, platform, shutil, ctypes, webbrowser, argparse
+from email.mime.text import MIMEText
+from email.header import Header
 import scipy.signal as sig
 from pathlib import Path
 from collections import deque
@@ -56,8 +58,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QV
     QHBoxLayout, QPushButton, QLineEdit, QLabel, QFrame, QScrollArea, QInputDialog,
     QMessageBox, QProgressBar, QTextEdit, QComboBox, QFileDialog, QDialog, QSlider,
     QGroupBox, QSpinBox, QCheckBox, QSizePolicy)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QAbstractNativeEventFilter
-from PyQt6.QtGui import QColor, QPalette, QFont, QPixmapCache
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractNativeEventFilter
+from PyQt6.QtGui import QColor, QPalette, QFont, QIcon
 
 # ── OS Detection ────────────────────────────────────────────────────────────
 IS_WINDOWS = platform.system() == "Windows"
@@ -136,11 +138,76 @@ def _assign_to_job(proc: "subprocess.Popen"):
         pass
 
 
-# ── Base Directory Detection ────────────────────────────────────────────────
+# ── Base Directory & OS Helpers ─────────────────────────────────────────────
 if getattr(sys, 'frozen', False):
     _BASE_DIR = Path(sys.executable).parent
 else:
     _BASE_DIR = Path(__file__).parent
+
+
+def _is_dir_writable(directory: Path) -> bool:
+    """Return True if directory exists (or can be created) and is writable by the current user."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".write_test_{os.getpid()}"
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("ok")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _setup_frozen_logging():
+    """Redirect stdout/stderr to a log file when running as a windowless frozen executable."""
+    if not getattr(sys, 'frozen', False):
+        return
+    log_dir = _BASE_DIR / "logs"
+    if not _is_dir_writable(log_dir):
+        local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+        log_dir = local_app_data / "LoudStream" / "logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+    log_file = log_dir / "loudstream.log"
+    try:
+        if log_file.exists() and log_file.stat().st_size > 2 * 1024 * 1024:
+            old_file = log_dir / "loudstream.log.old"
+            os.replace(log_file, old_file)
+        stream = open(log_file, "a", encoding="utf-8", buffering=1)
+        sys.stdout = stream
+        sys.stderr = stream
+    except Exception:
+        pass
+
+
+_setup_frozen_logging()
+
+
+def _find_binary(name: str) -> str | None:
+    """Find bundled binary in _BASE_DIR first (for Windows installer), falling back to PATH."""
+    exe_name = f"{name}.exe" if IS_WINDOWS else name
+    bundled = _BASE_DIR / exe_name
+    if bundled.is_file():
+        return str(bundled)
+    return shutil.which(name)
+
+
+class _SafeFormatDict(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def _safe_format(template: str, **kwargs) -> str:
+    """Safely format a user-editable template without raising KeyError or ValueError."""
+    try:
+        return template.format_map(_SafeFormatDict(kwargs))
+    except Exception:
+        result = template
+        for k, v in kwargs.items():
+            result = result.replace("{" + k + "}", str(v))
+        return result
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -150,19 +217,18 @@ else:
 
 # UI and metering constants
 WAVEFORM_HISTORY = 2048       # samples in waveform display
+_WAVEFORM_X = np.arange(WAVEFORM_HISTORY, dtype=np.float32)  # shared X-axis (avoids per-frame allocation)
 LUFS_SHORTTERM_SEC = 3.0      # 3 seconds - Short-term loudness
 SPECTRUM_UPDATE_INTERVAL = 0.20  # seconds between spectrum FFT updates (5 fps)
-LUFS_UPDATE_INTERVAL     = 0.50  # seconds between LUFS/TP computations (2 per sec)
+LUFS_UPDATE_INTERVAL     = 0.50  # seconds between LUFS computations (2 per sec)
 
 # ── Current Configuration ───────────────────────────────────────────────────
 class StreamConfig:
     """Global configuration — all parameters editable from the Options dialog."""
     def __init__(self):
-        # ── ffmpeg parameters ──
-        self.sample_rate      = 48000    # Hz: 22050 / 44100 / 48000
-        self.chunk_samples    = 480      # samples per chunk (10ms @ 48kHz)
-        self.probesize        = 150000   # bytes: 16384–200000 (150KB for reliable codec probing)
-        self.analyzeduration  = 1000000  # µs: 500000–3000000
+        # ── stream probing parameters ──
+        self.probesize        = 150000   # bytes: 8000–200000 (150KB for reliable codec probing)
+        self.analyzeduration  = 1000000  # µs: 200000–3000000
 
         # ── display parameters ──
         self.refresh_ms       = 100      # ms between UI refreshes (10 FPS)
@@ -174,7 +240,7 @@ class StreamConfig:
 
         # ── Automated Silence & Stream-Down Alerts (SMTP) ──
         self.silence_alerts_enabled = True
-        self.silence_threshold_lufs = -60.0  # dBFS: volume threshold below which audio is considered silent
+        self.silence_threshold_lufs = -60.0  # LUFS threshold below which audio is considered silent
         self.silence_alert_mins    = 10.0   # minutes before sending alert
         self.alert_cooldown_mins   = 60.0   # minutes before repeating alert for same stream
         self.global_alert_email    = ""     # recipient email address for alerts
@@ -192,18 +258,6 @@ class StreamConfig:
         self.recovery_body         = "Stream Recovery Notification\n\nStream Name: {stream_name}\nStream URL: {stream_url}\nStatus: Live & Audio Restored\nTime: {time}\n"
 
     @property
-    def chunk_bytes(self) -> int:
-        return self.chunk_samples * 4    # stereo s16le (2 channels × 2 bytes)
-
-    @property
-    def pipe_buffer_size(self) -> int:
-        return self.chunk_bytes * 8
-
-    @property
-    def chunk_ms(self) -> float:
-        return (self.chunk_samples / self.sample_rate) * 1000
-
-    @property
     def fps(self) -> float:
         return 1000 / self.refresh_ms
 
@@ -213,14 +267,39 @@ CONFIG = StreamConfig()
 
 
 # ── Customization directory (presets, standards, email template) ────────────
-_CUSTOMIZATION_DIR = _BASE_DIR / "customization"
+_BUNDLED_CUSTOMIZATION_DIR = _BASE_DIR / "customization"
+
+
+def _resolve_customization_dir() -> Path:
+    """Return writable customization directory (with %LOCALAPPDATA% fallback on locked Windows installs)."""
+    if _is_dir_writable(_BUNDLED_CUSTOMIZATION_DIR):
+        return _BUNDLED_CUSTOMIZATION_DIR
+    if IS_WINDOWS:
+        fallback = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "LoudStream" / "customization"
+    else:
+        fallback = Path.home() / ".config" / "LoudStream" / "customization"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        # Seed defaults from bundled customization dir on first run if present
+        if _BUNDLED_CUSTOMIZATION_DIR.exists() and not any(fallback.iterdir()):
+            shutil.copytree(_BUNDLED_CUSTOMIZATION_DIR, fallback, dirs_exist_ok=True)
+        return fallback
+    except Exception:
+        return _BUNDLED_CUSTOMIZATION_DIR
+
+
+_CUSTOMIZATION_DIR = _resolve_customization_dir()
 
 
 # ── Email template & alert persistence ───────────────────────────────────────────────
 # Two-file settings pattern:
 #   email_template.default.json  — factory defaults, shipped with the app, NEVER written by the app
 #   email_template.json          — user file, created on first Apply, always loaded in preference
-_EMAIL_TEMPLATE_DEFAULT = _CUSTOMIZATION_DIR / "email_template.default.json"
+_EMAIL_TEMPLATE_DEFAULT = (
+    _CUSTOMIZATION_DIR / "email_template.default.json"
+    if (_CUSTOMIZATION_DIR / "email_template.default.json").exists()
+    else _BUNDLED_CUSTOMIZATION_DIR / "email_template.default.json"
+)
 _EMAIL_TEMPLATE_USER    = _CUSTOMIZATION_DIR / "email_template.json"
 
 def _apply_template_data(data: dict):
@@ -300,6 +379,7 @@ _load_email_template()
 class AlertLockManager:
     """Inter-process file lock manager to coordinate alerts across multiple LoudStream instances."""
     _file_path = _CUSTOMIZATION_DIR / "alerts_lock.json"
+    _lock = threading.Lock()
 
     @classmethod
     def _read_data(cls) -> dict:
@@ -307,7 +387,8 @@ class AlertLockManager:
             return {}
         try:
             with open(cls._file_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
         except Exception:
             return {}
 
@@ -315,71 +396,81 @@ class AlertLockManager:
     def _write_data(cls, data: dict):
         try:
             cls._file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(cls._file_path, "w", encoding="utf-8") as f:
+            tmp_path = cls._file_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            try:
+                os.replace(tmp_path, cls._file_path)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                with open(cls._file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
         except Exception:
             pass
 
     @classmethod
-    def is_alert_recent(cls, stream_key: str, cooldown_sec: float) -> bool:
-        """Checks if an alert for stream_key was recorded within cooldown_sec across any instance."""
-        data = cls._read_data()
-        ts = data.get(stream_key, 0.0)
-        now = time.time()
-        if now - ts < cooldown_sec:
+    def try_acquire_alert(cls, stream_key: str, cooldown_sec: float) -> bool:
+        """Atomically checks if alert is outside cooldown and records current timestamp if so."""
+        with cls._lock:
+            data = cls._read_data()
+            now = time.time()
+            ts = data.get(stream_key, 0.0)
+            if now - ts < cooldown_sec:
+                return False
+            data[stream_key] = now
+            # Cleanup entries older than 24 hours
+            data = {k: v for k, v in data.items() if now - v < 86400}
+            cls._write_data(data)
             return True
-        return False
-
-    @classmethod
-    def record_alert(cls, stream_key: str):
-        """Records current timestamp for stream_key in shared lock file."""
-        data = cls._read_data()
-        now = time.time()
-        data[stream_key] = now
-        # Cleanup entries older than 24 hours
-        data = {k: v for k, v in data.items() if now - v < 86400}
-        cls._write_data(data)
 
     @classmethod
     def clear_alert(cls, stream_key: str):
         """Removes stream_key from shared lock file when stream recovers."""
-        data = cls._read_data()
-        if stream_key in data:
-            del data[stream_key]
-            cls._write_data(data)
+        with cls._lock:
+            data = cls._read_data()
+            if stream_key in data:
+                del data[stream_key]
+                cls._write_data(data)
 
 
 # ── Asynchronous Background SMTP Email Dispatcher ────────────────────────────
-def send_smtp_email_async(to_email: str, subject: str, body: str, on_complete=None):
-    """Sends an email in a background daemon thread via SMTP (100% automated)."""
+def send_smtp_email_async(to_email: str, subject: str, body: str, on_complete=None, smtp_config: dict | None = None):
+    """Sends an email in a background daemon thread via SMTP."""
     def _run_smtp():
+        cfg = smtp_config or {
+            "enabled": CONFIG.smtp_enabled,
+            "host": CONFIG.smtp_host,
+            "port": CONFIG.smtp_port,
+            "user": CONFIG.smtp_user,
+            "pass": CONFIG.smtp_pass,
+            "tls": CONFIG.smtp_tls,
+        }
         raw_parts = re.split(r'[,;]+', to_email) if to_email else []
         to_emails = list(dict.fromkeys(e.strip() for e in raw_parts if e.strip()))
-        if not CONFIG.smtp_enabled or not CONFIG.smtp_host or not to_emails:
+        if not cfg["enabled"] or not cfg["host"] or not to_emails:
             err = "SMTP is disabled or Host / Destination Email is missing"
             print(f"[SMTP Alert] Skipping dispatch: {err}")
             if on_complete: on_complete(False, err)
             return
-        
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.header import Header
 
         try:
             msg = MIMEText(body, 'plain', 'utf-8')
             msg['Subject'] = Header(subject, 'utf-8')
-            msg['From'] = CONFIG.smtp_user or "loudstream-alert@local"
+            msg['From'] = cfg["user"] or "loudstream-alert@local"
             msg['To'] = ", ".join(to_emails)
 
-            if CONFIG.smtp_port == 465:
-                server = smtplib.SMTP_SSL(CONFIG.smtp_host, CONFIG.smtp_port, timeout=12)
+            if cfg["port"] == 465:
+                server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=12)
             else:
-                server = smtplib.SMTP(CONFIG.smtp_host, CONFIG.smtp_port, timeout=12)
-                if CONFIG.smtp_tls:
+                server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=12)
+                if cfg["tls"]:
                     server.starttls()
 
-            if CONFIG.smtp_user and CONFIG.smtp_pass:
-                server.login(CONFIG.smtp_user, CONFIG.smtp_pass)
+            if cfg["user"] and cfg["pass"]:
+                server.login(cfg["user"], cfg["pass"])
 
             server.sendmail(msg['From'], to_emails, msg.as_string())
             server.quit()
@@ -393,7 +484,7 @@ def send_smtp_email_async(to_email: str, subject: str, body: str, on_complete=No
     threading.Thread(target=_run_smtp, daemon=True).start()
 
 
-# ── Standard di Metering (colorazione LUFS/TP) ──────────────────────────────────
+# ── Metering Standard (LUFS / Phase Correlation coloring) ────────────────────
 @dataclass
 class MeteringStandard:
     name: str
@@ -429,17 +520,16 @@ class MeteringStandard:
 
 
 # ── Metering standards — smart path resolution ──────────────────────────────
-# When running from source, standards.json lives at src/metering_standards/.
-# When installed (Windows bundle), it lives at customization/metering_standards/.
 def _resolve_metering_standards_file() -> Path:
-    """Return the standards.json path, preferring the customization/ overlay."""
-    installed = _CUSTOMIZATION_DIR / "metering_standards" / "standards.json"
-    if installed.exists():
-        return installed
-    bundled = _BASE_DIR / "metering_standards" / "standards.json"
-    if bundled.exists():
-        return bundled
-    return installed  # Return preferred path; loader will report the error
+    """Return the standards.json path from customization/metering_standards/."""
+    for candidate in (
+        _CUSTOMIZATION_DIR / "metering_standards" / "standards.json",
+        _BUNDLED_CUSTOMIZATION_DIR / "metering_standards" / "standards.json",
+        _BASE_DIR / "metering_standards" / "standards.json",
+    ):
+        if candidate.exists():
+            return candidate
+    return _CUSTOMIZATION_DIR / "metering_standards" / "standards.json"
 
 _METERING_STANDARDS_FILE = _resolve_metering_standards_file()
 
@@ -502,12 +592,6 @@ TEXT      = "#e0e4f0"
 TEXT_DIM  = "#7a80a0"
 CLOSE_BTN = "#ffffff"
 
-# ── Helper stili ─────────────────────────────────────────────────────────────
-def _css(color, size=14, bold=False):
-    """Genera CSS inline per label. Uso: setStyleSheet(_css(ACCENT, 16, bold=True))"""
-    w = "font-weight:bold;" if bold else ""
-    return f"color:{color};font-size:{size}px;font-family:'Courier New';{w}"
-
 # ── LUFS Calculator ──────────────────────────────────────────────────────────
 _LUFS_METER_CACHE: Dict[int, object] = {}
 
@@ -532,7 +616,7 @@ def _get_fft_cache(sample_rate: int, fft_size: int = 2048, n_display: int = 256)
         freq_per_bin = sample_rate / fft_size
         bin_indices = np.clip((log_freqs / freq_per_bin).astype(int), 0, fft_size // 2)
         x_axis = np.log10(log_freqs).astype(np.float32)
-        _FFT_CACHE_GLOBAL[key] = (window, log_freqs, bin_indices, x_axis)
+        _FFT_CACHE_GLOBAL[key] = (window, bin_indices, x_axis)
     return _FFT_CACHE_GLOBAL[key]
 
 
@@ -546,27 +630,10 @@ class StreamWorker(QObject):
         self.url = url
         self._stop_event = threading.Event()
         self._alive = True
+        self._thread = None
         
-        self.sample_rate = CONFIG.sample_rate
-        self.chunk_samples = CONFIG.chunk_samples
-        self.waveform_smooth = CONFIG.waveform_smooth
-        
-        # Setup filter coefficients statefully
-        meter = _get_lufs_meter(self.sample_rate)
-        if meter is not None and hasattr(meter, '_filters'):
-            self.has_pyln = True
-            self.b_hs = meter._filters['high_shelf'].b.copy()
-            self.a_hs = meter._filters['high_shelf'].a.copy()
-            self.b_hp = meter._filters['high_pass'].b.copy()
-            self.a_hp = meter._filters['high_pass'].a.copy()
-            
-            import scipy.signal as sig
-            self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
-            self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
-            self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
-            self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
-        else:
-            self.has_pyln = False
+        self.sample_rate = 48000
+        self.has_pyln = False
             
         # Waveform ring buffers
         self._waveform_arr_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
@@ -577,7 +644,7 @@ class StreamWorker(QObject):
         self._display_r = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
         
         # Incremental LUFS deque (maxlen safety net for long-running stability)
-        self._lufs_window_frames = 3 * self.sample_rate
+        self._lufs_window_frames = int(LUFS_SHORTTERM_SEC * self.sample_rate)
         self._lufs_deque = deque(maxlen=200)
         self._lufs_deque_frames = 0
         
@@ -594,41 +661,38 @@ class StreamWorker(QObject):
         self._raw_filled = 0
         
         # UI cached states
-        self._latest_lufs = -70.0
+        self._latest_lufs = -999.0
         self._latest_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._latest_spec_r = np.zeros(256, dtype=np.float32) - 80.0
         
         self._last_ui_emit_time = 0.0
         self._last_spectrum_update = 0.0
         self._last_lufs_update = 0.0
+        self._last_chunk_time = 0.0
         self._fft_updated = False
         
-        # ── Pre-allocated Zero-Allocation Thread-Safe UI Buffer ─────────────
+        # ── Pre-allocated Thread-Safe UI Buffer ─────────────────────────────
         self._state_lock = threading.Lock()
         self._ui_waveform_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
         self._ui_waveform_r = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
         self._ui_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._ui_spec_r = np.zeros(256, dtype=np.float32) - 80.0
-        self._ui_lufs = -70.0
+        self._ui_lufs = -999.0
         self._ui_corr = 0.0
         self._ui_fft_updated = False
         self._ui_data_dirty = False
         
         # Pre-cache FFT constants to avoid lookups in process loop
-        self.fft_window, _, self.fft_bin_indices, _ = _get_fft_cache(self.sample_rate, 2048)
+        self.fft_window, self.fft_bin_indices, _ = _get_fft_cache(self.sample_rate, 2048)
 
     def start(self):
         self._stop_event.clear()
-        threading.Thread(target=self._run, daemon=True).start()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def stop(self):
         self._alive = False
         self._stop_event.set()
-        # Killa subito il proc se esiste, per sbloccare stdout.read() nel thread
-        proc = getattr(self, '_proc', None)
-        if proc and proc.poll() is None:
-            try: proc.kill()
-            except Exception: pass
 
     def _safe_emit(self, signal, *args):
         if not self._alive: return
@@ -700,7 +764,7 @@ class StreamWorker(QObject):
         self._latest_corr = (1.0 - alpha) * self._latest_corr + alpha * inst_corr
             
         # Calculate symmetric min/max peak envelopes over small blocks (independent of chunk size)
-        block_size = max(8, self.waveform_smooth * 16)
+        block_size = max(8, CONFIG.waveform_smooth * 16)
         n_blocks = n_frames // block_size
         
         if n_blocks > 0:
@@ -748,6 +812,7 @@ class StreamWorker(QObject):
             self._waveform_write_idx = w_end % w_size
             
         current_time = time.time()
+        self._last_chunk_time = current_time
         
         # 5. FFT Update
         if (current_time - self._last_spectrum_update >= SPECTRUM_UPDATE_INTERVAL
@@ -779,7 +844,7 @@ class StreamWorker(QObject):
             self._latest_spec_l = db_l[self.fft_bin_indices]
             self._latest_spec_r = db_r[self.fft_bin_indices]
             
-        # 6. LUFS & TP update (Throttled: 2 updates per sec)
+        # 6. LUFS update (Throttled: 2 updates per sec)
         if (current_time - self._last_lufs_update >= LUFS_UPDATE_INTERVAL
                 and self._lufs_deque_frames >= self.sample_rate // 2):
             self._last_lufs_update = current_time
@@ -800,10 +865,8 @@ class StreamWorker(QObject):
                 self._latest_lufs = lufs if math.isfinite(lufs) else -70.0
             else:
                 self._latest_lufs = -70.0
-                
 
-            
-        # 7. GUI Throttled state update (20 FPS = 50ms, Zero-Allocation)
+        # 7. GUI Throttled state update
         refresh_interval = CONFIG.refresh_ms * 0.001
         if current_time - self._last_ui_emit_time >= refresh_interval:
             self._last_ui_emit_time = current_time
@@ -841,7 +904,15 @@ class StreamWorker(QObject):
             self._raw_buf[:] = 0
             self._raw_write_idx = 0
             self._raw_filled = 0
-            self._latest_lufs = -70.0
+            self._latest_lufs = -999.0
+            self._last_chunk_time = 0.0
+            self._latest_spec_l[:] = -80.0
+            self._latest_spec_r[:] = -80.0
+            with self._state_lock:
+                self._ui_lufs = -999.0
+                self._ui_corr = 0.0
+                self._ui_fft_updated = False
+                self._ui_data_dirty = False
             try:
                 # Open the audio stream in-process with timeout and auto-reconnect configuration
                 container = av.open(self.url, options={
@@ -858,11 +929,11 @@ class StreamWorker(QObject):
                     raise ValueError("No audio stream found")
                     
                 audio_stream = container.streams.audio[0]
-                native_rate = audio_stream.codec_context.sample_rate if audio_stream.codec_context.sample_rate else 48000
+                native_rate = audio_stream.codec_context.sample_rate or 48000
                 
                 # Dynamically match native sample rate to avoid fractional resampling computations
                 self.sample_rate = native_rate
-                self._lufs_window_frames = 3 * native_rate
+                self._lufs_window_frames = int(LUFS_SHORTTERM_SEC * native_rate)
                 
                 # Dynamically set up the filter coefficients for this native rate
                 meter = _get_lufs_meter(native_rate)
@@ -881,7 +952,7 @@ class StreamWorker(QObject):
                     self.has_pyln = False
                     
                 # Cache FFT constants for the native rate
-                self.fft_window, _, self.fft_bin_indices, _ = _get_fft_cache(native_rate, 2048)
+                self.fft_window, self.fft_bin_indices, _ = _get_fft_cache(native_rate, 2048)
                 
                 # Setup resampler to output standard stereo s16 at native sample rate (no rate change)
                 resampler = AudioResampler(
@@ -890,6 +961,7 @@ class StreamWorker(QObject):
                     rate=native_rate
                 )
                 
+                self._last_chunk_time = time.time()
                 self._safe_emit(self.status_signal, "live")
                 self._retry_count = 0  # Reset retry counter on successful connection
                 
@@ -899,67 +971,47 @@ class StreamWorker(QObject):
                 acc_idx = 0
                 
                 # Decode packets and feed samples chunk-by-chunk to the DSP pipeline
-                try:
-                    for packet in container.demux(audio_stream):
-                        if self._stop_event.is_set() or not self._alive:
-                            del packet
-                            break
-                        try:
-                            for frame in packet.decode():
-                                if self._stop_event.is_set() or not self._alive:
-                                    del frame
-                                    break
+                for packet in container.demux(audio_stream):
+                    if self._stop_event.is_set() or not self._alive:
+                        break
+                    try:
+                        for frame in packet.decode():
+                            if self._stop_event.is_set() or not self._alive:
+                                break
+                            
+                            is_native = (
+                                frame.format.name == 's16' and 
+                                frame.sample_rate == native_rate and 
+                                frame.layout.name == 'stereo'
+                            )
+                            
+                            resampled_frames = [frame] if is_native else resampler.resample(frame)
+                            for resampled in resampled_frames:
+                                samples = resampled.to_ndarray()[0]
+                                n_s = len(samples)
                                 
-                                is_native = (
-                                    frame.format.name == 's16' and 
-                                    frame.sample_rate == native_rate and 
-                                    frame.layout.name == 'stereo'
-                                )
+                                if acc_idx + n_s > len(acc_buf):
+                                    acc_buf = np.resize(acc_buf, acc_idx + n_s + target_size)
+                                    
+                                acc_buf[acc_idx:acc_idx + n_s] = samples
+                                acc_idx += n_s
                                 
-                                if is_native:
-                                    resampled_frames = [frame]
-                                else:
-                                    resampled_frames = resampler.resample(frame)
-                                    
-                                for resampled in resampled_frames:
-                                    samples = resampled.to_ndarray()[0]
-                                    n_s = len(samples)
-                                    
-                                    if acc_idx + n_s > len(acc_buf):
-                                        acc_buf = np.resize(acc_buf, acc_idx + n_s + target_size)
-                                        
-                                    acc_buf[acc_idx:acc_idx + n_s] = samples
-                                    acc_idx += n_s
-                                    
-                                    if acc_idx >= target_size:
-                                        self._process_chunk(acc_buf[:acc_idx])
-                                        acc_idx = 0
-                                        
-                                    if not is_native:
-                                        del resampled
-                                if not is_native:
-                                    del resampled_frames
-                                del frame
-                        except av.AVError:
-                            # Skip corrupted/missing frames silently (just like standard FFmpeg)
-                            pass
-                        del packet
-                except av.AVError as e:
-                    # Bubble up network drop exceptions to trigger QThread reconnect
-                    raise e
+                                if acc_idx >= target_size:
+                                    self._process_chunk(acc_buf[:acc_idx])
+                                    acc_idx = 0
+                    except av.FFmpegError:
+                        # Skip corrupted/missing frames silently
+                        pass
                             
                 # Flush the resampler at EOF
                 if self._alive and not self._stop_event.is_set():
-                    resampled_frames = resampler.resample(None)
-                    for resampled in resampled_frames:
+                    for resampled in resampler.resample(None):
                         samples = resampled.to_ndarray()[0]
                         n_s = len(samples)
                         if acc_idx + n_s > len(acc_buf):
                             acc_buf = np.resize(acc_buf, acc_idx + n_s + target_size)
                         acc_buf[acc_idx:acc_idx + n_s] = samples
                         acc_idx += n_s
-                        del resampled
-                    del resampled_frames
                     
                     if acc_idx > 0:
                         self._process_chunk(acc_buf[:acc_idx])
@@ -977,7 +1029,7 @@ class StreamWorker(QObject):
                         container.close()
                     except Exception:
                         pass
-                    container = None  # Release reference for GC safety
+                    container = None
                         
             # If the connection drops, wait 30 seconds before attempting reconnect
             if self._alive and not self._stop_event.is_set():
@@ -1006,7 +1058,7 @@ def kill_all_ffplay():
         try:
             if proc.poll() is None: proc.kill()
             proc.wait(timeout=2)
-        except: pass
+        except Exception: pass
     with _ffplay_lock: _ffplay_procs.clear()
 
 atexit.register(kill_all_ffplay)
@@ -1046,7 +1098,8 @@ class AudioPlayer(QObject):
 
     def _run(self):
         # Low-latency flags matching StreamWorker, using CONFIG settings
-        cmd = ["ffplay", "-nodisp",
+        ffplay_bin = _find_binary("ffplay") or "ffplay"
+        cmd = [ffplay_bin, "-nodisp",
                "-fflags", "+nobuffer+flush_packets", "-flags", "low_delay",
                "-probesize", str(CONFIG.probesize), "-analyzeduration", str(CONFIG.analyzeduration),
                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
@@ -1079,24 +1132,12 @@ class AudioPlayer(QObject):
             except RuntimeError: pass
 
 
-# ── Tooltip scuro personalizzato ──────────────────────────────────────────────
-TOOLTIP_STYLE = """
-    QToolTip {
-        background-color: #000000;
-        color: #ffffff;
-        border: 1px solid #3a3f52;
-        padding: 6px 8px;
-        font-family: 'Courier New';
-        font-size: 13px;
-    }
-"""
-
-
 # ── Dialog Options ──────────────────────────────────────────────────────
 class OptionsDialog(QDialog):
     """Dialog per configurare liberamente tutti i parametri di streaming e display."""
 
     config_changed = pyqtSignal()
+    _smtp_test_done_sig = pyqtSignal(bool, str, str)
 
     # ── stile slider condiviso ───────────────────────────────────────────
     _SLIDER_STYLE = f"""
@@ -1195,6 +1236,7 @@ class OptionsDialog(QDialog):
             }}
         """)
         self._build_ui()
+        self._smtp_test_done_sig.connect(self._on_smtp_test_result)
 
     # ── helper: crea una riga label + slider + spinbox + info ─────────────
     def _make_slider_row(self, parent_layout, label: str, min_v: int, max_v: int,
@@ -1320,45 +1362,11 @@ class OptionsDialog(QDialog):
         scroll_layout.setContentsMargins(0, 0, 10, 0)
 
         # ════════════════════════════════════════════════════════════════
-        # Gruppo: Decodifica ffmpeg
+        # Gruppo: Decodifica stream
         # ════════════════════════════════════════════════════════════════
-        grp_ff = QGroupBox("FFMPEG Decoding Parameters")
+        grp_ff = QGroupBox("Stream Probing Parameters")
         ff_layout = QVBoxLayout(grp_ff)
         ff_layout.setSpacing(8)
-
-        # Sample rate — combobox (valori discreti)
-        sr_row = QHBoxLayout()
-        sr_row.setSpacing(12)
-        sr_lbl = QLabel("Sample Rate")
-        sr_lbl.setFixedWidth(200)
-        sr_lbl.setStyleSheet(f"color: {TEXT}; font-size: 14px; font-family: 'Courier New';")
-        sr_lbl.setToolTip("Sample Rate used by FFMPEG")
-        self._sr_combo = QComboBox()
-        self._sr_combo.setMinimumHeight(28)
-        for sr in [22050, 44100, 48000]:
-            self._sr_combo.addItem(f"{sr} Hz", sr)
-        self._sr_combo.setCurrentIndex(
-            [22050, 44100, 48000].index(CONFIG.sample_rate)
-            if CONFIG.sample_rate in [22050, 44100, 48000] else 2
-        )
-        sr_row.addWidget(sr_lbl)
-        sr_row.addWidget(self._sr_combo, 1)
-        ff_layout.addLayout(sr_row)
-
-        # Chunk samples
-        self._chunk_slider, self._chunk_spin, self._chunk_val = self._make_slider_row(
-            ff_layout,
-            "Chunk samples",
-            min_v=64, max_v=2048, value=CONFIG.chunk_samples,
-            fmt="smp",
-            tip="Samples per Chunk. Lower values = more reactive, Higher values = more stable"
-        )
-        self._chunk_slider.setSingleStep(64)
-        self._chunk_slider.setPageStep(128)
-        self._chunk_spin.setSingleStep(64)
-        self._chunk_slider.valueChanged.connect(
-            lambda v: self._chunk_val.setText(
-                f"smp ({(v/self._current_sr())*1000:.1f}ms)"))
 
         # Probesize
         self._probe_slider, self._probe_spin, self._probe_val = self._make_slider_row(
@@ -1366,7 +1374,7 @@ class OptionsDialog(QDialog):
             "Probesize (KB)",
             min_v=8, max_v=200, value=CONFIG.probesize // 1000,
             fmt="KB",
-            tip="Bytes ffmpeg analyzes to detect format. Less = faster, more = stable"
+            tip="Bytes analyzed on connection to detect stream codec. Less = faster, more = stable"
         )
         self._probe_slider.valueChanged.connect(
             lambda v: self._probe_val.setText("KB"))
@@ -1377,7 +1385,7 @@ class OptionsDialog(QDialog):
             "Analyze duration (ms)",
             min_v=200, max_v=3000, value=CONFIG.analyzeduration // 1000,
             fmt="ms",
-            tip="ffmpeg initial analysis duration. Less = faster connection"
+            tip="Initial stream analysis duration. Less = faster connection"
         )
         self._analyze_slider.valueChanged.connect(
             lambda v: self._analyze_val.setText("ms"))
@@ -1417,9 +1425,9 @@ class OptionsDialog(QDialog):
         scroll_layout.addWidget(grp_disp)
 
         # ════════════════════════════════════════════════════════════════
-        # Gruppo: Metering Standard (colorazione LUFS/TP)
+        # Gruppo: Metering Standard (colorazione LUFS / correlazione)
         # ════════════════════════════════════════════════════════════════
-        grp_meter = QGroupBox("Standard Metering (Coloring for LUFS/TP)")
+        grp_meter = QGroupBox("Standard Metering (LUFS / Phase Coloring)")
         meter_layout = QVBoxLayout(grp_meter)
         meter_layout.setSpacing(8)
 
@@ -1429,7 +1437,7 @@ class OptionsDialog(QDialog):
         std_lbl = QLabel("Standard")
         std_lbl.setFixedWidth(200)
         std_lbl.setStyleSheet(f"color: {TEXT}; font-size: 14px; font-family: 'Courier New';")
-        std_lbl.setToolTip("Select the standard for LUFS and Sample Peak meter coloring")
+        std_lbl.setToolTip("Select the standard for LUFS and Phase Correlation meter coloring")
         
         self._metering_combo = QComboBox()
         self._metering_combo.setMinimumHeight(28)
@@ -1681,9 +1689,6 @@ class OptionsDialog(QDialog):
         btn_row.addWidget(apply_btn)
         layout.addLayout(btn_row)
 
-    def _current_sr(self) -> int:
-        return self._sr_combo.currentData() or 48000
-
     def _update_metering_desc(self, std_name: str):
         """Updates the description and target values for the selected standard."""
         if std_name in METERING_STANDARDS:
@@ -1698,11 +1703,9 @@ class OptionsDialog(QDialog):
             self._std_values.setText("")
 
     def _reset_defaults(self):
-        self._sr_combo.setCurrentIndex(2)  # 48000
-        self._chunk_slider.setValue(480)
-        self._probe_slider.setValue(50)
+        self._probe_slider.setValue(150)
         self._analyze_slider.setValue(1000)
-        self._refresh_slider.setValue(50)
+        self._refresh_slider.setValue(100)
         self._smooth_slider.setValue(4)
         # Reset metering standard to EBU R128
         idx = list(METERING_STANDARDS.keys()).index("EBU R128")
@@ -1727,50 +1730,42 @@ class OptionsDialog(QDialog):
         self._cooldown_mins_spin.setValue(int(defaults.get("alert_cooldown_mins", 60)))
         self._smtp_enabled_chk.setChecked(bool(defaults.get("smtp_enabled", False)))
 
+    def _on_smtp_test_result(self, success: bool, msg: str, to_email: str):
+        if success:
+            QMessageBox.information(self, "SMTP Test Success", f"✓ Test email sent successfully to:\n{to_email}")
+        else:
+            QMessageBox.critical(self, "SMTP Test Failure", f"✗ Could not send test email:\n{msg}")
+
     def _test_smtp_connection(self):
         to_email = self._global_email_edit.text().strip()
         if not to_email:
             QMessageBox.warning(self, "SMTP Test Error", "Please enter a Global Recipient Email first.")
             return
 
-        # Temporarily store active fields to test
-        orig_enabled = CONFIG.smtp_enabled
-        orig_host = CONFIG.smtp_host
-        orig_port = CONFIG.smtp_port
-        orig_user = CONFIG.smtp_user
-        orig_pass = CONFIG.smtp_pass
-        orig_tls = CONFIG.smtp_tls
-
-        CONFIG.smtp_enabled = True
-        CONFIG.smtp_host = self._smtp_host_edit.text().strip()
-        CONFIG.smtp_port = self._smtp_port_spin.value()
-        CONFIG.smtp_user = self._smtp_user_edit.text().strip()
-        CONFIG.smtp_pass = self._smtp_pass_edit.text()
-        CONFIG.smtp_tls = self._smtp_tls_chk.isChecked()
+        test_cfg = {
+            "enabled": True,
+            "host": self._smtp_host_edit.text().strip(),
+            "port": self._smtp_port_spin.value(),
+            "user": self._smtp_user_edit.text().strip(),
+            "pass": self._smtp_pass_edit.text(),
+            "tls": self._smtp_tls_chk.isChecked(),
+        }
 
         def _on_smtp_test_done(success: bool, msg: str):
-            CONFIG.smtp_enabled = orig_enabled
-            CONFIG.smtp_host = orig_host
-            CONFIG.smtp_port = orig_port
-            CONFIG.smtp_user = orig_user
-            CONFIG.smtp_pass = orig_pass
-            CONFIG.smtp_tls = orig_tls
-            
-            if success:
-                QMessageBox.information(self, "SMTP Test Success", f"✓ Test email sent successfully to:\n{to_email}")
-            else:
-                QMessageBox.critical(self, "SMTP Test Failure", f"✗ Could not send test email:\n{msg}")
+            try:
+                self._smtp_test_done_sig.emit(success, msg, to_email)
+            except RuntimeError:
+                pass
 
         send_smtp_email_async(
             to_email,
             "[LoudStream Test] SMTP Connection Test",
             "This is a test notification from LoudStream automated monitor.\nYour SMTP settings are working properly!",
-            on_complete=_on_smtp_test_done
+            on_complete=_on_smtp_test_done,
+            smtp_config=test_cfg,
         )
 
     def _apply(self):
-        CONFIG.sample_rate       = self._sr_combo.currentData()
-        CONFIG.chunk_samples     = self._chunk_slider.value()
         CONFIG.probesize         = self._probe_slider.value() * 1000
         CONFIG.analyzeduration   = self._analyze_slider.value() * 1000
         CONFIG.refresh_ms        = self._refresh_slider.value()
@@ -1802,16 +1797,16 @@ class StreamCard(QFrame):
     remove_requested = pyqtSignal(object)
     listen_requested = pyqtSignal(object)   # emesso quando si vuole ascoltare
 
-    def __init__(self, url: str, index: int, parent=None, email: str = "", stagger_delay_ms: int = 0):
+    def __init__(self, url: str, index: int, parent=None, email: str = "", stagger_delay_ms: int = 0, name: str = ""):
         super().__init__(parent)
         self.url = url
         self.index = index
-        self._custom_name = ""          # nome impostato dall'utente
+        self._custom_name = name.strip()  # nome impostato dall'utente o dal CSV
         self._email = email             # email di contatto per supporto
         
         self._status = "connecting"
+        self._in_error = False
         self._worker = None
-        self._qthread = None
         self._listening = False
         
         # ── Zero-allocation pre-allocated display buffers ──
@@ -1824,7 +1819,10 @@ class StreamCard(QFrame):
         self._down_start_time = None
         self._down_reason = ""
         self._alert_sent = False
+        self._alert_in_flight = False
+        self._last_alert_attempt_time = None
         self._last_alert_key = ""
+        self._current_lufs = -999.0        # unthrottled LUFS reading for accurate alert detection
         
         # ── Performance: color cache & display values (throttled updates) ──
         self._last_lufs_color  = None      # cached LUFS color (avoid setStyleSheet)
@@ -1875,7 +1873,7 @@ class StreamCard(QFrame):
         self._index_label.setFixedWidth(22)
 
         # Editable name — shows URL as dark tooltip
-        default_name = self._short_url()
+        default_name = self._custom_name or self._short_url()
         self._name_edit = QLineEdit(default_name)
         self._name_edit.setPlaceholderText("Stream…")
         self._name_edit.setToolTip(self.url)
@@ -2071,11 +2069,6 @@ class StreamCard(QFrame):
         meter_row.addWidget(self._corr_label)
         root.addLayout(meter_row)
 
-        self._display_waveform_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
-        self._display_waveform_r = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
-        self._display_spec_l = np.zeros(256, dtype=np.float32) - 80.0
-        self._display_spec_r = np.zeros(256, dtype=np.float32) - 80.0
-
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _short_url(self, max_len: int = 42) -> str:
         return self.url if len(self.url) <= max_len else self.url[:max_len - 1] + "…"
@@ -2107,12 +2100,15 @@ class StreamCard(QFrame):
             QPushButton:hover {{ color: {TEXT}; border-color: {GRAY2}; }}
         """
 
+    def _refresh_name_display(self):
+        base_name = self._custom_name or self._short_url()
+        self._name_edit.setText(f"⚠ {base_name}" if self._in_error else base_name)
+
     def update_index(self, new_index: int):
         self.index = new_index
         self._index_label.setText(f"#{new_index + 1}")
-        # Aggiorna placeholder ma non il testo se l'utente l'ha personalizzato
         if not self._custom_name:
-            self._name_edit.setText(self._short_url())
+            self._refresh_name_display()
 
     def set_listening(self, active: bool):
         self._listening = active
@@ -2130,22 +2126,22 @@ class StreamCard(QFrame):
 
     def _on_name_changed(self):
         txt = self._name_edit.text().strip()
-        self._custom_name = txt
-        if not txt:
-            # Ripristina URL abbreviato se l'utente cancella tutto
-            self._name_edit.setText(self._short_url())
+        if txt.startswith("⚠"):
+            txt = txt.lstrip("⚠").strip()
+        if not txt or txt == self._short_url():
             self._custom_name = ""
+        else:
+            self._custom_name = txt
+        self._refresh_name_display()
 
     def _send_email(self):
         """Opens default email client with pre-filled subject about this stream."""
         if not self._email:
             return
         stream_name = self._custom_name or self._short_url()
-        # Use configurable email template with placeholder substitution
-        subject = CONFIG.email_subject.format(stream_name=stream_name, stream_url=self.url)
-        body = CONFIG.email_body.format(stream_name=stream_name, stream_url=self.url)
-        # URL-encode subject and body for mailto link
-        import urllib.parse
+        # Use configurable email template with safe placeholder substitution
+        subject = _safe_format(CONFIG.email_subject, stream_name=stream_name, stream_url=self.url)
+        body = _safe_format(CONFIG.email_body, stream_name=stream_name, stream_url=self.url)
         mailto_url = f"mailto:{self._email}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
         try:
             webbrowser.open(mailto_url)
@@ -2154,32 +2150,22 @@ class StreamCard(QFrame):
 
     # ── Stream ────────────────────────────────────────────────────────────────
     def _start_stream(self):
-        self._qthread = QThread()
         self._worker = StreamWorker(self.url)
-        self._worker.moveToThread(self._qthread)
         self._worker.error_signal.connect(self._on_error)
         self._worker.status_signal.connect(self._on_status)
-        self._qthread.started.connect(self._worker.start)
-        # Ensure Qt properly frees thread and worker objects on exit
-        self._qthread.finished.connect(self._qthread.deleteLater)
-        self._qthread.finished.connect(self._worker.deleteLater)
-        self._qthread.start()
+        self._worker.start()
 
     def stop_stream(self):
-        if self._worker:
-            self._worker.stop()   # killa subito ffmpeg e setta stop_event
-            # Disconnetti tutti i segnali prima che Qt distrugga l'oggetto
+        worker = self._worker
+        self._worker = None
+        if worker:
+            worker.stop()
+            # Disconnetti tutti i segnali prima che l'oggetto venga rilasciato
             try:
-                self._worker.error_signal.disconnect()
-                self._worker.status_signal.disconnect()
+                worker.error_signal.disconnect()
+                worker.status_signal.disconnect()
             except RuntimeError:
                 pass  # già disconnessi
-        if self._qthread:
-            self._qthread.quit()
-            if not self._qthread.wait(3000):
-                # Thread still running: force terminate
-                self._qthread.terminate()
-                self._qthread.wait(1000)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
     def _on_status(self, status: str):
@@ -2190,7 +2176,9 @@ class StreamCard(QFrame):
         # Unconditionally restore name text & style when connecting/live
         # (fixes race condition where error_signal fires after status_signal)
         if status in ("connecting", "live"):
-            self._name_edit.setText(self._custom_name or self._short_url())
+            self._in_error = False
+            self._refresh_name_display()
+            self._name_edit.setToolTip(self.url)
             self._name_edit.setStyleSheet(f"""
                 QLineEdit {{
                     background: transparent;
@@ -2210,6 +2198,14 @@ class StreamCard(QFrame):
                     border: 1px solid {ACCENT};
                     border-radius: 3px;
                 }}
+                QToolTip {{
+                    background-color: #000000;
+                    color: #ffffff;
+                    border: 1px solid #3a3f52;
+                    padding: 4px 6px;
+                    font-family: 'Courier New';
+                    font-size: 11px;
+                }}
             """)
                 
         if status in ("connecting", "stopped"):
@@ -2221,13 +2217,47 @@ class StreamCard(QFrame):
             self._lufs_label.setText("LUFS —.—")
             self._corr_label.setText("Φ ——")
             self._lufs_bar.setValue(0)
+            self._current_lufs = -999.0
+            self._last_lufs_display = -999.0
+            self._last_corr_display = -999.0
+            self._last_lufs_color = None
+            self._last_corr_color = None
             if self._worker:
                 with self._worker._state_lock:
                     self._worker._ui_data_dirty = False
 
     def _on_error(self, msg: str):
-        self._name_edit.setText(f"⚠ {msg}")
-        self._name_edit.setStyleSheet(f"color: {RED}; font-size: 13px; font-family: 'Courier New'; background: transparent; border: none;")
+        self._in_error = True
+        self._refresh_name_display()
+        self._name_edit.setToolTip(f"{self.url}\n⚠ {msg}")
+        self._name_edit.setStyleSheet(f"""
+            QLineEdit {{
+                background: transparent;
+                color: {RED};
+                border: none;
+                border-bottom: 1px solid transparent;
+                font-size: 12px;
+                font-family: 'Courier New';
+                font-weight: bold;
+                padding: 2px 4px;
+            }}
+            QLineEdit:hover {{
+                border-bottom: 1px solid {GRAY2};
+            }}
+            QLineEdit:focus {{
+                background: {BG_CARD2};
+                border: 1px solid {ACCENT};
+                border-radius: 3px;
+            }}
+            QToolTip {{
+                background-color: #000000;
+                color: #ffffff;
+                border: 1px solid #3a3f52;
+                padding: 4px 6px;
+                font-family: 'Courier New';
+                font-size: 11px;
+            }}
+        """)
 
     def refresh_display(self, current_time: float, metering_std: "MeteringStandard"):
         """Called by _refresh_all() every frame with pre-computed time and standard."""
@@ -2235,26 +2265,68 @@ class StreamCard(QFrame):
         if worker is None:
             return
 
+        has_new_data = False
+        with worker._state_lock:
+            if worker._ui_data_dirty:
+                worker._ui_data_dirty = False
+                has_new_data = True
+                self._display_waveform_l[:] = worker._ui_waveform_l
+                self._display_waveform_r[:] = worker._ui_waveform_r
+                self._display_spec_l[:] = worker._ui_spec_l
+                self._display_spec_r[:] = worker._ui_spec_r
+                lufs = worker._ui_lufs
+                corr = worker._ui_corr
+                fft_updated = worker._ui_fft_updated
+                self._current_lufs = lufs
+
+        # Detect stalled stream ("live" socket open, but zero packets decoded for >3 seconds)
+        if (
+            self._status == "live"
+            and not has_new_data
+            and worker._last_chunk_time > 0
+            and (current_time - worker._last_chunk_time) > 3.0
+            and self._current_lufs > -900.0
+        ):
+            self._current_lufs = -999.0
+            self._last_lufs_display = -999.0
+            self._last_corr_display = -999.0
+            self._last_lufs_color = None
+            self._last_corr_color = None
+            self._curve_l.setData([], skipFiniteCheck=True)
+            self._curve_r.setData([], skipFiniteCheck=True)
+            self._spectrum_curve_l.setData([], skipFiniteCheck=True)
+            self._spectrum_curve_r.setData([], skipFiniteCheck=True)
+            self._lufs_label.setText("LUFS —.—")
+            self._corr_label.setText("Φ ——")
+            self._lufs_bar.setValue(0)
+
         # ── Silence & Stream-Down Automated Email Alert Engine ──
-        # IMPORTANT: This must run BEFORE the _ui_data_dirty early-return guard.
-        # When a stream is disconnected, no audio data arrives so the dirty flag
-        # is never set and the function would return early — permanently skipping
-        # alert detection. We use self._last_lufs_display as the cached LUFS value
-        # (it retains the last known reading; -999.0 when stream has no audio).
+        # Runs regardless of has_new_data so disconnected streams are monitored continuously.
         if CONFIG.silence_alerts_enabled:
-            lufs_for_alert = self._last_lufs_display  # -999.0 when stream is silent/down
+            lufs_for_alert = self._current_lufs  # -999.0 when stream has no valid audio yet
             is_down = (self._status in ("connecting", "stopped")) or (lufs_for_alert <= CONFIG.silence_threshold_lufs)
 
             if is_down:
                 if self._down_start_time is None:
                     self._down_start_time = current_time
                     self._down_reason = "Stream Disconnected" if self._status in ("connecting", "stopped") else f"Audio Silence (LUFS <= {CONFIG.silence_threshold_lufs:.1f} dBFS)"
+                elif self._status in ("connecting", "stopped"):
+                    self._down_reason = "Stream Disconnected"
 
                 down_duration_sec = current_time - self._down_start_time
                 threshold_sec = CONFIG.silence_alert_mins * 60.0
+                cooldown_sec = CONFIG.alert_cooldown_mins * 60.0
+                can_attempt = (
+                    not self._alert_in_flight
+                    and (
+                        self._last_alert_attempt_time is None
+                        or (current_time - self._last_alert_attempt_time) >= cooldown_sec
+                    )
+                )
 
-                if down_duration_sec >= threshold_sec and not self._alert_sent:
-                    self._alert_sent = True
+                if down_duration_sec >= threshold_sec and can_attempt:
+                    self._alert_in_flight = True
+                    self._last_alert_attempt_time = current_time
                     stream_name = self._custom_name or self._short_url()
                     alert_key = f"{stream_name}_{self.url}"
                     self._last_alert_key = alert_key
@@ -2264,24 +2336,27 @@ class StreamCard(QFrame):
                     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
                     reason = self._down_reason
 
-                    subject = CONFIG.alert_subject.format(
+                    subject = _safe_format(
+                        CONFIG.alert_subject,
                         stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
                     )
-                    body = CONFIG.alert_body.format(
+                    body = _safe_format(
+                        CONFIG.alert_body,
                         stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
                     )
 
-                    # Dispatch via background daemon thread with multi-instance lock & jitter (0 GUI blocking!)
+                    # Dispatch via background daemon thread with multi-instance lock & jitter
                     def _dispatch_alert_worker():
-                        import random
-                        time.sleep(random.uniform(0.05, 0.25))
-                        cooldown_sec = CONFIG.alert_cooldown_mins * 60.0
-                        if not AlertLockManager.is_alert_recent(alert_key, cooldown_sec):
-                            AlertLockManager.record_alert(alert_key)
-                            print(f"[Alert Triggered] Stream '{stream_name}' DOWN for {dur_str} ({reason}). Dispatching SMTP alert...")
-                            send_smtp_email_async(recipient, subject, body)
-                        else:
-                            print(f"[Alert Suppressed] Alert for stream '{stream_name}' already dispatched by sister LoudStream instance.")
+                        try:
+                            time.sleep(random.uniform(0.05, 0.25))
+                            if AlertLockManager.try_acquire_alert(alert_key, cooldown_sec):
+                                self._alert_sent = True
+                                print(f"[Alert Triggered] Stream '{stream_name}' DOWN for {dur_str} ({reason}). Dispatching SMTP alert...")
+                                send_smtp_email_async(recipient, subject, body)
+                            else:
+                                print(f"[Alert Suppressed] Alert for stream '{stream_name}' already dispatched by sister LoudStream instance.")
+                        finally:
+                            self._alert_in_flight = False
 
                     threading.Thread(target=_dispatch_alert_worker, daemon=True).start()
             else:
@@ -2293,41 +2368,34 @@ class StreamCard(QFrame):
 
                     AlertLockManager.clear_alert(self._last_alert_key)
 
-                    subject = CONFIG.recovery_subject.format(
+                    subject = _safe_format(
+                        CONFIG.recovery_subject,
                         stream_name=stream_name, stream_url=self.url, time=now_str
                     )
-                    body = CONFIG.recovery_body.format(
+                    body = _safe_format(
+                        CONFIG.recovery_body,
                         stream_name=stream_name, stream_url=self.url, time=now_str
                     )
 
                     print(f"[Recovery Triggered] Stream '{stream_name}' RECOVERED. Dispatching SMTP recovery email...")
                     send_smtp_email_async(recipient, subject, body)
 
-                    self._alert_sent = False
-                    self._last_alert_key = ""
-
+                self._alert_sent = False
+                self._alert_in_flight = False
+                self._last_alert_attempt_time = None
+                self._last_alert_key = ""
                 self._down_start_time = None
 
-        with worker._state_lock:
-            if not worker._ui_data_dirty:
-                return
-            worker._ui_data_dirty = False
-
-            self._display_waveform_l[:] = worker._ui_waveform_l
-            self._display_waveform_r[:] = worker._ui_waveform_r
-            self._display_spec_l[:] = worker._ui_spec_l
-            self._display_spec_r[:] = worker._ui_spec_r
-            lufs = worker._ui_lufs
-            corr = worker._ui_corr
-            fft_updated = worker._ui_fft_updated
+        if not has_new_data:
+            return
 
         # ── Waveform curves (L top, R bottom) ──
-        self._curve_l.setData(self._display_waveform_l, skipFiniteCheck=True)
-        self._curve_r.setData(self._display_waveform_r, skipFiniteCheck=True)
+        self._curve_l.setData(_WAVEFORM_X, self._display_waveform_l, skipFiniteCheck=True)
+        self._curve_r.setData(_WAVEFORM_X, self._display_waveform_r, skipFiniteCheck=True)
 
         # ── Spectrum Analyzer FFT curves ──
         if fft_updated:
-            _, _, _, x_axis = _get_fft_cache(worker.sample_rate, 2048)
+            _, _, x_axis = _get_fft_cache(worker.sample_rate, 2048)
             self._spectrum_curve_l.setData(x_axis, self._display_spec_l, skipFiniteCheck=True)
             self._spectrum_curve_r.setData(x_axis, self._display_spec_r, skipFiniteCheck=True)
 
@@ -2335,10 +2403,12 @@ class StreamCard(QFrame):
         # LUFS display values
         if lufs <= -60:
             txt, bar_val, color = "LUFS —.—", 0, TEXT_DIM
+            display_lufs = -70.0
         else:
             txt = f"LUFS {lufs:+.1f}"
             bar_val = int(max(0, min(100, (lufs + 60) / 54 * 100)))
             color = metering_std.get_lufs_color(lufs)
+            display_lufs = lufs
 
         # Correlation display
         corr_color = metering_std.get_corr_color(corr)
@@ -2349,11 +2419,11 @@ class StreamCard(QFrame):
             corr_txt = f"Φ {corr:+.2f}"
 
         # Throttle updates: only write when value changes
-        lufs_changed = abs(lufs - self._last_lufs_display) >= 0.2
+        lufs_changed = abs(display_lufs - self._last_lufs_display) >= 0.2
         corr_changed = abs(corr - self._last_corr_display) >= 0.05 or (lufs <= -60 and self._last_corr_display != -999.0)
 
         if lufs_changed:
-            self._last_lufs_display = lufs
+            self._last_lufs_display = display_lufs
             self._lufs_label.setText(txt)
             self._lufs_bar.setValue(bar_val)
         if corr_changed:
@@ -2388,11 +2458,12 @@ class SessionNotificationFilter(QAbstractNativeEventFilter):
                 msg_ptr = int(message)
                 msg_id = ctypes.c_uint.from_address(msg_ptr + ctypes.sizeof(ctypes.c_void_p)).value
                 if msg_id == WM_WTSSESSION_CHANGE:
-                    wparam_offset = ctypes.sizeof(ctypes.c_void_p) + ctypes.sizeof(ctypes.c_uint)
-                    wparam = ctypes.c_ulonglong.from_address(msg_ptr + wparam_offset).value
+                    wparam_offset = 2 * ctypes.sizeof(ctypes.c_void_p)
+                    wparam = ctypes.c_size_t.from_address(msg_ptr + wparam_offset).value
                     if wparam == WTS_SESSION_UNLOCK and self._callback:
                         self._callback()
-            except: pass
+            except Exception:
+                pass
         return False, 0
 
 
@@ -2415,10 +2486,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_preset_list()
 
-        self._last_gc_sweep = time.time()
         self._timer = QTimer()
         self._timer.timeout.connect(self._refresh_all)
-        # Use CONFIG.refresh_ms (default 50ms = 20fps) — was hardcoded to 66ms
         self._timer.start(CONFIG.refresh_ms)
 
         # ── Registrazione notifiche sessione Windows ──────────────────────
@@ -2471,6 +2540,11 @@ class MainWindow(QMainWindow):
             default = self._preset_dir / "default.csv"
             if default.exists():
                 self._load_preset_file(default, silent=True)
+            else:
+                for f in self._preset_files():
+                    if f.stem.lower() == "default":
+                        self._load_preset_file(f, silent=True)
+                        break
 
     def _build_ui(self):
         self.setStyleSheet(f"""
@@ -2780,8 +2854,6 @@ class MainWindow(QMainWindow):
             return
 
         if not rows:
-           # QMessageBox.warning(self, "Preset vuoto",
-           #                     f"Nessuna riga valida trovata in:\n{path.name}")
             return
 
         if replace:
@@ -2797,13 +2869,9 @@ class MainWindow(QMainWindow):
                 continue
             idx = len(self._cards)
             card = StreamCard(url, idx, self._grid_container, email=email,
-                             stagger_delay_ms=added * 250)
+                             stagger_delay_ms=added * 250, name=name)
             card.remove_requested.connect(self._remove_card)
             card.listen_requested.connect(self._on_listen_requested)
-            # Imposta nome custom se specificato nel CSV
-            if name:
-                card._custom_name = name
-                card._name_edit.setText(name)
             self._cards.append(card)
             added += 1
 
@@ -2845,7 +2913,7 @@ class MainWindow(QMainWindow):
                 writer = csv.writer(f)
                 writer.writerow(["nome", "url", "email"])   # intestazione
                 for card in self._cards:
-                    name = card._custom_name or card._name_edit.text()
+                    name = card._custom_name or card._name_edit.text().lstrip("⚠").strip()
                     writer.writerow([name, card.url, card._email])
             self._refresh_preset_list()
             # Seleziona il preset appena salvato nel combo
@@ -3082,11 +3150,6 @@ class MainWindow(QMainWindow):
             if card.isVisible():
                 card.refresh_display(now, std)
 
-        # Periodic maintenance sweep (every 60 seconds) to clear Qt graphics caches
-        if now - self._last_gc_sweep >= 60.0:
-            self._last_gc_sweep = now
-            QPixmapCache.clear()
-
     def _show_options(self):
         """Mostra il dialog delle opzioni."""
         dialog = OptionsDialog(self)
@@ -3111,23 +3174,28 @@ class MainWindow(QMainWindow):
             self,
             "Configuration Applied",
             f"Settings updated.\n\n"
-            f"Sample Rate: {CONFIG.sample_rate} Hz  |  "
-            f"Chunk: {CONFIG.chunk_samples} smp ({CONFIG.chunk_ms:.1f} ms)\n"
+            f"Probesize: {CONFIG.probesize // 1000} KB  |  "
+            f"Analyze: {CONFIG.analyzeduration // 1000} ms\n"
             f"Refresh: {CONFIG.refresh_ms} ms ({CONFIG.fps:.0f} FPS)  |  "
             f"Smooth: {CONFIG.waveform_smooth}×\n\n"
             f"Standard Metering: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f}  |  "
             f"Φ warning: < {metering_std.corr_warning:.1f}\n\n"
-            f"New settings apply immediately."
+            f"Display and alert settings apply immediately."
         )
 
     def _on_session_unlock(self):
         QTimer.singleShot(200, self._force_refresh_waveforms)
     
     def _force_refresh_waveforms(self):
+        now = time.time()
+        std = get_current_metering_standard()
         for card in self._cards:
-            try: card._plot.repaint(); card.refresh_display()
-            except: pass
+            try:
+                card._plot.repaint()
+                card.refresh_display(now, std)
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         # ── Deregistra notifiche sessione Windows ─────────────────────────
@@ -3161,8 +3229,8 @@ def preboot_log():
     print(f"  Sistema:    {platform.system()} {platform.release()}")
     print(f"  Macchina:   {platform.machine()}")
     print(f"  Processore: {platform.processor() or 'N/A'}")
-    ffmpeg_ok = "✓" if shutil.which("ffmpeg") else "✗ NON TROVATO"
-    ffplay_ok = "✓" if shutil.which("ffplay") else "✗ NON TROVATO"
+    ffmpeg_ok = "✓" if _find_binary("ffmpeg") else "✗ NON TROVATO"
+    ffplay_ok = "✓" if _find_binary("ffplay") else "✗ NON TROVATO"
     print(f"  ffmpeg:     {ffmpeg_ok}  |  ffplay: {ffplay_ok}")
     print(f"{sep}\n")
 
@@ -3185,6 +3253,15 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("LoudStream")
+
+    for icon_candidate in (
+        _BASE_DIR / "icons" / "LoudStream.ico",
+        _BASE_DIR / "LoudStream.ico",
+        _BASE_DIR.parent / "LoudStream.ico",
+    ):
+        if icon_candidate.is_file():
+            app.setWindowIcon(QIcon(str(icon_candidate)))
+            break
 
     # Dark palette globale
     palette = QPalette()

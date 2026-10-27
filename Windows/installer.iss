@@ -35,7 +35,7 @@ OutputBaseFilename=LoudStream_installer
 SetupIconFile={#SourceIcons}\LoudStream.ico
 
 ; License agreement - user must accept before installing
-LicenseFile={#SourcePath}\LICENSE
+LicenseFile={#SourcePath}..\LICENSE
 
 Compression=lzma
 SolidCompression=no
@@ -60,11 +60,16 @@ Source: "{#SourceApp}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceApp}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceFfmpeg}\ffmpeg.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceFfmpeg}\ffplay.exe"; DestDir: "{app}"; Flags: ignoreversion
-; User-customizable folder - contains presets, metering_standards, email_template
-Source: "{#SourcePath}customization\*"; DestDir: "{app}\customization"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceIcons}\LoudStream.ico"; DestDir: "{app}\icons"; Flags: ignoreversion
+; User-customizable folder - contains factory defaults (never overwrites user settings or presets)
+Source: "{#SourcePath}..\src\customization\email_template.default.json"; DestDir: "{app}\customization"; Flags: ignoreversion
+Source: "{#SourcePath}..\src\customization\metering_standards\*"; DestDir: "{app}\customization\metering_standards"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourcePath}..\src\customization\presets\Default.csv"; DestDir: "{app}\customization\presets"; Flags: onlyifdoesntexist
 
 [Dirs]
-Name: "{app}\logs"
+Name: "{app}\customization"; Permissions: users-modify
+Name: "{app}\customization\presets"; Permissions: users-modify
+Name: "{app}\logs"; Permissions: users-modify
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenuicon

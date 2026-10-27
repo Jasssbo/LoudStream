@@ -14,7 +14,12 @@
 /Windows/ffmpeg_bin/*
 /Windows/ffmpeg_bin/LICENSE
 src/customization/presets/*.csv
+!src/customization/presets/Default.csv
 /IA-docs
+src/customization/email_template.json
+src/customization/alerts_lock.json
+src/customization/alerts_lock.tmp.*
+src/logs/
 
 /Windows/Output/*
 

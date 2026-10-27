@@ -35,22 +35,20 @@ Per monitorare fino a 16 stream stereo contemporaneamente in tempo reale senza c
 ```text
 LoudStream/
 ├── src/
-│   ├── LoudStream.py     # Versione cross-platform
-│   ├── requirements.txt      # Dipendenze Python
-│   ├── metering_standards/standards.json   # File per richiamare gli standard di misurazione
-│   └── presets/Default.csv   # File per richiamare set di IP + Nome corrisponente + email supporto tecnico
+│   ├── LoudStream.py             # Sorgente unico cross-platform (Linux & Windows)
+│   ├── requirements.txt          # Dipendenze Python
+│   └── customization/
+│       ├── metering_standards/standards.json   # File per richiamare gli standard di misurazione
+│       ├── presets/Default.csv                 # Template CSV predefinito (nome,url,email)
+│       ├── email_template.default.json         # Configurazione predefinita di sola lettura per gli alert SMTP
+│       └── email_template.json                 # File utente per personalizzare le impostazioni degli alert SMTP e le email
 ├── Windows/
-│   ├── LoudStream_windows.py   # Versione Windows
-│   ├── LoudStream_windows.spec # Config PyInstaller
-│   ├── installer.iss               # Script Inno Setup
-│   ├── customization/
-│   │   ├── metering_standards/standards.json   # File per richiamare gli standard di misurazione
-│   │   ├── presets/Default.csv                 # File per richiamare set di IP + Nome corrisponente + email supporto tecnico
-│   │   ├── email_template.default.json         # Configurazione predefinita di sola lettura per gli alert SMTP
-│   │   └── email_template.json                 # File utente per personalizzare le impostazioni degli alert SMTP e le email
-│   └── ffmpeg_bin/                             # Binari FFMPEG per packaging con InnoSetup
-|       ├── ffmpeg.exe       # scaricabile da https://ffmpeg.org/download.html
-|       └── ffplay.exe       # scaricabile da https://ffmpeg.org/download.html
+│   ├── LoudStream.spec           # Config PyInstaller (compila da ../src/LoudStream.py)
+│   ├── installer.iss             # Script Inno Setup
+│   ├── icons/LoudStream.ico      # Icona applicazione
+│   └── ffmpeg_bin/               # Binari FFMPEG per packaging con InnoSetup
+│       ├── ffmpeg.exe            # scaricabile da https://ffmpeg.org/download.html
+│       └── ffplay.exe            # scaricabile da https://ffmpeg.org/download.html
 └── README.md
 ```
 
@@ -166,7 +164,7 @@ Copia `ffmpeg.exe` e `ffplay.exe` nella cartella ffmpeg_bin:
 
 ```powershell o bash
 cd Windows
-pyinstaller LoudStream_windows.spec
+pyinstaller LoudStream.spec
 ```
 
 L'eseguibile verrà creato in:

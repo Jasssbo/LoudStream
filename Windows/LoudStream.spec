@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['LoudStream.py'],
+    ['../src/LoudStream.py'],
     pathex=[],
     binaries=[],
     datas=[],
