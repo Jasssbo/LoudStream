@@ -353,7 +353,8 @@ class AlertLockManager:
 def send_smtp_email_async(to_email: str, subject: str, body: str, on_complete=None):
     """Sends an email in a background daemon thread via SMTP (100% automated)."""
     def _run_smtp():
-        to_emails = [e.strip() for e in to_email.split(',') if e.strip()] if to_email else []
+        raw_parts = re.split(r'[,;]+', to_email) if to_email else []
+        to_emails = list(dict.fromkeys(e.strip() for e in raw_parts if e.strip()))
         if not CONFIG.smtp_enabled or not CONFIG.smtp_host or not to_emails:
             err = "SMTP is disabled or Host / Destination Email is missing"
             print(f"[SMTP Alert] Skipping dispatch: {err}")
@@ -1158,6 +1159,29 @@ class OptionsDialog(QDialog):
                 border: 1px solid {GRAY}; border-radius: 4px;
                 padding: 6px 10px; font-family: 'Courier New'; font-size: 15px;
             }}
+            QSpinBox::up-button {{
+                subcontrol-origin: border;
+                subcontrol-position: top right;
+                width: 20px;
+                border-left: 1px solid {GRAY};
+                border-bottom: 1px solid {GRAY};
+                border-top-right-radius: 4px;
+            }}
+            QSpinBox::down-button {{
+                subcontrol-origin: border;
+                subcontrol-position: bottom right;
+                width: 20px;
+                border-left: 1px solid {GRAY};
+                border-bottom-right-radius: 4px;
+            }}
+            QSpinBox::up-arrow {{
+                image: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M7%2014l5-5%205%205z%22%2F%3E%3C%2Fsvg%3E");
+                width: 12px; height: 12px;
+            }}
+            QSpinBox::down-arrow {{
+                image: url("data:image/svg+xml;charset=utf-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2024%2024%22%3E%3Cpath%20fill%3D%22white%22%20d%3D%22M7%2010l5%205%205-5z%22%2F%3E%3C%2Fsvg%3E");
+                width: 12px; height: 12px;
+            }}
             QComboBox {{
                 background: {BG_CARD2}; color: {TEXT};
                 border: 1px solid {GRAY}; border-radius: 4px;
@@ -1513,40 +1537,37 @@ class OptionsDialog(QDialog):
         # Silence Volume Threshold (dBFS)
         vol_row = QHBoxLayout()
         vol_lbl = QLabel("Silence Volume Threshold (dBFS):")
-        vol_lbl.setFixedWidth(240)
         self._silence_thresh_spin = QSpinBox()
         self._silence_thresh_spin.setRange(-80, -20)
         self._silence_thresh_spin.setValue(int(CONFIG.silence_threshold_lufs))
         self._silence_thresh_spin.setFixedWidth(90)
         vol_row.addWidget(vol_lbl)
-        vol_row.addWidget(self._silence_thresh_spin)
         vol_row.addStretch()
+        vol_row.addWidget(self._silence_thresh_spin)
         alert_layout.addLayout(vol_row)
 
         # Silence / Down threshold (mins)
         thresh_row = QHBoxLayout()
         thresh_lbl = QLabel("Silence/Down Threshold (mins):")
-        thresh_lbl.setFixedWidth(240)
         self._alert_mins_spin = QSpinBox()
         self._alert_mins_spin.setRange(1, 120)
         self._alert_mins_spin.setValue(int(CONFIG.silence_alert_mins))
         self._alert_mins_spin.setFixedWidth(90)
         thresh_row.addWidget(thresh_lbl)
-        thresh_row.addWidget(self._alert_mins_spin)
         thresh_row.addStretch()
+        thresh_row.addWidget(self._alert_mins_spin)
         alert_layout.addLayout(thresh_row)
 
         # Cooldown (mins)
         cool_row = QHBoxLayout()
         cool_lbl = QLabel("Alert Repeat Cooldown (mins):")
-        cool_lbl.setFixedWidth(240)
         self._cooldown_mins_spin = QSpinBox()
         self._cooldown_mins_spin.setRange(5, 1440)
         self._cooldown_mins_spin.setValue(int(CONFIG.alert_cooldown_mins))
         self._cooldown_mins_spin.setFixedWidth(90)
         cool_row.addWidget(cool_lbl)
-        cool_row.addWidget(self._cooldown_mins_spin)
         cool_row.addStretch()
+        cool_row.addWidget(self._cooldown_mins_spin)
         alert_layout.addLayout(cool_row)
 
         # Global alert recipient email
@@ -2237,7 +2258,7 @@ class StreamCard(QFrame):
                     stream_name = self._custom_name or self._short_url()
                     alert_key = f"{stream_name}_{self.url}"
                     self._last_alert_key = alert_key
-                    recipient = self._email or CONFIG.global_alert_email
+                    recipient = ", ".join(filter(None, [self._email, CONFIG.global_alert_email]))
                     dur_mins = int(down_duration_sec // 60)
                     dur_str = f"{dur_mins} minute(s)"
                     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2267,7 +2288,7 @@ class StreamCard(QFrame):
                 # Stream is live and audio is normal
                 if self._alert_sent and self._last_alert_key:
                     stream_name = self._custom_name or self._short_url()
-                    recipient = self._email or CONFIG.global_alert_email
+                    recipient = ", ".join(filter(None, [self._email, CONFIG.global_alert_email]))
                     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
                     AlertLockManager.clear_alert(self._last_alert_key)
