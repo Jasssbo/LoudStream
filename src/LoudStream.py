@@ -1,5 +1,5 @@
 """
-LoudStream v1.0
+LoudStream v1.1
 MIT License
 Copyright (c) 2026 Andrea Mazzurana
 
@@ -725,7 +725,7 @@ CLOSE_BTN = "#ffffff"
 class AudioAnalyzer:
     """
     Real-time DSP Audio Analyzer conforming to EBU R128 / ITU-R BS.1770-4.
-    Computes Short-term (3.0s) and Momentary (400ms) LUFS with O(1) sliding window,
+    Computes Short-term (3.0s) LUFS with true O(1) sliding window,
     monitors continuous silence (< -40 dBFS) with configurable tolerance,
     and detects dead stream conditions (0 bytes from FFmpeg for > dead_timeout).
     """
@@ -756,7 +756,6 @@ class AudioAnalyzer:
         self.silence_tolerance_sec = float(silence_tolerance_sec)
         self.stream_dead_timeout_sec = float(stream_dead_timeout_sec)
 
-        self._frames_momentary = int(0.400 * self.sample_rate)  # 400ms
         self._frames_shortterm = int(3.000 * self.sample_rate)  # 3.0s
 
         self._init_filters()
@@ -770,7 +769,6 @@ class AudioAnalyzer:
         self._last_data_time = time.monotonic()
         self._silence_start_time = None
         self._last_lufs = -70.0
-        self._last_momentary_lufs = -70.0
 
     def _init_filters(self):
         if self.sample_rate in self._COEFFS:
@@ -809,16 +807,15 @@ class AudioAnalyzer:
         self._last_data_time = time.monotonic()
         self._silence_start_time = None
         self._last_lufs = -70.0
-        self._last_momentary_lufs = -70.0
         self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
         self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
         self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
         self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
 
-    def process_chunk(self, chunk: np.ndarray | bytes, now: float | None = None) -> tuple[float, float, bool, bool]:
+    def process_chunk(self, chunk: np.ndarray | bytes, now: float | None = None) -> tuple[float, bool, bool]:
         """
         Processes stereo PCM chunk (int16 or float32).
-        Returns: (short_term_lufs, momentary_lufs, is_silence, is_stream_dead)
+        Returns: (short_term_lufs, is_silence, is_stream_dead)
         """
         if now is None:
             now = time.monotonic()
@@ -838,7 +835,7 @@ class AudioAnalyzer:
         n_frames = stereo.shape[0]
         if n_frames == 0:
             st, is_sil, is_dead = self.get_status(now)
-            return st, self._last_momentary_lufs, is_sil, is_dead
+            return st, is_sil, is_dead
 
         # Two-stage stateful K-Weighting
         fl, self.zi_hs_l = sig.lfilter(self.b_hs, self.a_hs, stereo[:, 0], zi=self.zi_hs_l)
@@ -883,30 +880,8 @@ class AudioAnalyzer:
         else:
             self._last_lufs = -70.0
 
-        self._last_momentary_lufs = self._calc_momentary_lufs()
-
         st, is_sil, is_dead = self.get_status(now)
-        return st, self._last_momentary_lufs, is_sil, is_dead
-
-    def _calc_momentary_lufs(self) -> float:
-        frames_needed = self._frames_momentary
-        sum_l = 0.0
-        sum_r = 0.0
-        frames_counted = 0
-
-        for item in reversed(self._history):
-            sum_l += item[0]
-            sum_r += item[1]
-            frames_counted += item[2]
-            if frames_counted >= frames_needed:
-                break
-
-        if frames_counted > 0:
-            ms_l = sum_l / frames_counted
-            ms_r = sum_r / frames_counted
-            m_lufs = -0.691 + 10.0 * math.log10(ms_l + ms_r + 1e-10)
-            return max(-70.0, m_lufs) if math.isfinite(m_lufs) else -70.0
-        return -70.0
+        return st, is_sil, is_dead
 
     def get_status(self, now: float | None = None) -> tuple[float, bool, bool]:
         if now is None:
@@ -985,7 +960,6 @@ class StreamWorker(QObject):
         
         # UI cached states
         self._latest_lufs = -999.0
-        self._latest_momentary_lufs = -999.0
         self._latest_is_silence = False
         self._latest_is_stream_dead = False
         self._latest_spec_l = np.zeros(256, dtype=np.float32) - 80.0
@@ -1007,7 +981,6 @@ class StreamWorker(QObject):
         self._ui_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._ui_spec_r = np.zeros(256, dtype=np.float32) - 80.0
         self._ui_lufs = -999.0
-        self._ui_momentary_lufs = -999.0
         self._ui_is_silence = False
         self._ui_is_stream_dead = False
         self._ui_corr = 0.0
@@ -1058,10 +1031,9 @@ class StreamWorker(QObject):
             self._raw_write_idx = end_idx % buf_size
             self._raw_filled = min(self._raw_filled + n_frames, buf_size)
             
-        # 3. AudioAnalyzer EBU R128 Loudness (Short-Term & Momentary) & Silence / Stream-Dead Detection
-        st_lufs, m_lufs, is_sil, is_dead = self.analyzer.process_chunk(stereo_f32)
+        # 3. AudioAnalyzer EBU R128 Short-Term Loudness & Silence / Stream-Dead Detection
+        st_lufs, is_sil, is_dead = self.analyzer.process_chunk(stereo_f32)
         self._latest_lufs = st_lufs
-        self._latest_momentary_lufs = m_lufs
         self._latest_is_silence = is_sil
         self._latest_is_stream_dead = is_dead
             
@@ -1176,7 +1148,6 @@ class StreamWorker(QObject):
                 self._ui_spec_l[:] = self._latest_spec_l
                 self._ui_spec_r[:] = self._latest_spec_r
                 self._ui_lufs = self._latest_lufs
-                self._ui_momentary_lufs = self._latest_momentary_lufs
                 self._ui_is_silence = self._latest_is_silence
                 self._ui_is_stream_dead = self._latest_is_stream_dead
                 self._ui_corr = self._latest_corr
@@ -1199,7 +1170,6 @@ class StreamWorker(QObject):
             self._raw_write_idx = 0
             self._raw_filled = 0
             self._latest_lufs = -999.0
-            self._latest_momentary_lufs = -999.0
             self._latest_is_silence = False
             self._latest_is_stream_dead = False
             self._last_chunk_time = 0.0
@@ -1207,7 +1177,6 @@ class StreamWorker(QObject):
             self._latest_spec_r[:] = -80.0
             with self._state_lock:
                 self._ui_lufs = -999.0
-                self._ui_momentary_lufs = -999.0
                 self._ui_is_silence = False
                 self._ui_is_stream_dead = False
                 self._ui_corr = 0.0
@@ -2130,7 +2099,6 @@ class StreamCard(QFrame):
         self._last_alert_attempt_time = None
         self._last_alert_key = ""
         self._current_lufs = -999.0        # unthrottled LUFS reading for accurate alert detection
-        self._current_momentary_lufs = -999.0  # momentary LUFS (400ms window)
         self._healthy_since = None         # debounced recovery tracking
         self._is_visual_alert = False      # tracks if border is highlighted in red alert state
         
@@ -2587,14 +2555,11 @@ class StreamCard(QFrame):
                 self._display_spec_l[:] = worker._ui_spec_l
                 self._display_spec_r[:] = worker._ui_spec_r
                 lufs = worker._ui_lufs
-                m_lufs = worker._ui_momentary_lufs
                 corr = worker._ui_corr
                 fft_updated = worker._ui_fft_updated
                 self._current_lufs = lufs
-                self._current_momentary_lufs = m_lufs
             else:
                 lufs = self._current_lufs
-                m_lufs = self._current_momentary_lufs
                 corr = worker._ui_corr
                 fft_updated = False
 
@@ -2796,9 +2761,8 @@ class StreamCard(QFrame):
                 self._last_lufs_display = display_lufs
                 self._lufs_label.setText(txt)
                 self._lufs_bar.setValue(bar_val)
-                m_txt = f"{self._current_momentary_lufs:+.1f} LUFS" if self._current_momentary_lufs > -60 else "—.—"
                 self._lufs_label.setToolTip(
-                    f"Short-Term (3s): {txt}\nMomentary (400ms): {m_txt}\nSilence Threshold: {CONFIG.silence_threshold_lufs:.1f} dBFS"
+                    f"Short-Term LUFS (3s): {txt}\nSilence Threshold: {CONFIG.silence_threshold_lufs:.1f} dBFS"
                 )
             if corr_changed:
                 self._last_corr_display = corr
@@ -2969,7 +2933,7 @@ class MainWindow(QMainWindow):
         left_col = QVBoxLayout()
         left_col.setSpacing(1)
 
-        title = QLabel("LoudStream v1.0")
+        title = QLabel("LoudStream v1.1")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-family: 'Courier New'; font-weight: bold; letter-spacing: 2px;")
 
         # Author attribution
