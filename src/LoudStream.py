@@ -335,7 +335,7 @@ class StreamConfig:
 
         # ── Automated Silence & Stream-Down Alerts (SMTP) ──
         self.silence_alerts_enabled = True
-        self.silence_threshold_lufs = -60.0  # LUFS threshold below which audio is considered silent
+        self.silence_threshold_lufs = -40.0  # LUFS threshold below which audio is considered silent (-40 dBFS)
         self.silence_alert_mins    = 10.0   # minutes before sending alert
         self.alert_cooldown_mins   = 60.0   # minutes before repeating alert for same stream
         self.global_alert_email    = ""     # recipient email address for alerts
@@ -1035,61 +1035,58 @@ class StreamWorker(QObject):
         if samples.size == 0:
             return
         
-        # Reshape to (N, 2) stereo
-        stereo = samples.reshape(-1, 2)
-        n_frames = stereo.shape[0]
+        # 1. Reshape to stereo int16 for raw FFT circular buffer
+        stereo_int16 = samples.reshape(-1, 2)
+        n_frames = stereo_int16.shape[0]
+        # Normalization to float32 [-1.0, +1.0] once for both DSP and envelope
+        stereo_f32 = stereo_int16.astype(np.float32) * (1.0 / 32768.0)
         
-        # 1. Update Small Raw Buffer for FFT
+        # 2. Update Small Raw Buffer for FFT
         buf_size = self._raw_buf_size
         if n_frames >= buf_size:
-            self._raw_buf[:] = stereo[-buf_size:]
+            self._raw_buf[:] = stereo_int16[-buf_size:]
             self._raw_write_idx = 0
             self._raw_filled = buf_size
         else:
             end_idx = self._raw_write_idx + n_frames
             if end_idx <= buf_size:
-                self._raw_buf[self._raw_write_idx:end_idx] = stereo
+                self._raw_buf[self._raw_write_idx:end_idx] = stereo_int16
             else:
                 first_part = buf_size - self._raw_write_idx
-                self._raw_buf[self._raw_write_idx:] = stereo[:first_part]
-                self._raw_buf[:n_frames - first_part] = stereo[first_part:]
+                self._raw_buf[self._raw_write_idx:] = stereo_int16[:first_part]
+                self._raw_buf[:n_frames - first_part] = stereo_int16[first_part:]
             self._raw_write_idx = end_idx % buf_size
             self._raw_filled = min(self._raw_filled + n_frames, buf_size)
             
-        # 2. AudioAnalyzer EBU R128 Loudness (Short-Term & Momentary) & Silence / Stream-Dead Detection
-        st_lufs, m_lufs, is_sil, is_dead = self.analyzer.process_chunk(stereo)
+        # 3. AudioAnalyzer EBU R128 Loudness (Short-Term & Momentary) & Silence / Stream-Dead Detection
+        st_lufs, m_lufs, is_sil, is_dead = self.analyzer.process_chunk(stereo_f32)
         self._latest_lufs = st_lufs
         self._latest_momentary_lufs = m_lufs
         self._latest_is_silence = is_sil
         self._latest_is_stream_dead = is_dead
             
-        # 3. Stereo Phase Correlation (EMA, ~1s time constant)
-        chunk_l = stereo[:, 0].astype(np.float32)
-        chunk_r = stereo[:, 1].astype(np.float32)
-        dot_lr = float(np.dot(chunk_l, chunk_r))
-        dot_ll = float(np.dot(chunk_l, chunk_l))
-        dot_rr = float(np.dot(chunk_r, chunk_r))
+        # 4. Stereo Phase Correlation (EMA, ~1s time constant) using stereo_f32
+        ch_l = stereo_f32[:, 0]
+        ch_r = stereo_f32[:, 1]
+        dot_lr = float(np.dot(ch_l, ch_r))
+        dot_ll = float(np.dot(ch_l, ch_l))
+        dot_rr = float(np.dot(ch_r, ch_r))
         denom = math.sqrt(dot_ll * dot_rr)
         inst_corr = dot_lr / denom if denom > 0 else 0.0
         # Exponential moving average: alpha = chunk_duration / 1.0s
         alpha = min(n_frames / self.sample_rate, 1.0)
         self._latest_corr = (1.0 - alpha) * self._latest_corr + alpha * inst_corr
             
-        # Calculate symmetric min/max peak envelopes over small blocks (independent of chunk size)
+        # 5. Calculate symmetric min/max peak envelopes over small blocks
         block_size = max(8, CONFIG.waveform_smooth * 16)
         n_blocks = n_frames // block_size
         
         if n_blocks > 0:
-            # Re-use the existing float32 arrays (chunk_l, chunk_r) instead of allocating new np.abs() arrays
-            tr_l = chunk_l[:n_blocks * block_size].reshape(n_blocks, block_size)
-            tr_r = chunk_r[:n_blocks * block_size].reshape(n_blocks, block_size)
+            abs_l = np.abs(ch_l[:n_blocks * block_size]).reshape(n_blocks, block_size)
+            abs_r = np.abs(ch_r[:n_blocks * block_size]).reshape(n_blocks, block_size)
             
-            # In-place absolute value
-            np.abs(tr_l, out=tr_l)
-            np.abs(tr_r, out=tr_r)
-            
-            peaks_l = np.max(tr_l, axis=1)
-            peaks_r = np.max(tr_r, axis=1)
+            peaks_l = np.max(abs_l, axis=1)
+            peaks_r = np.max(abs_r, axis=1)
             
             req_size = 2 * n_blocks
             if req_size > len(self._scratch_env_l):
@@ -1099,12 +1096,10 @@ class StreamWorker(QObject):
             env_l = self._scratch_env_l[:req_size]
             env_l[0::2] = peaks_l
             env_l[1::2] = -peaks_l
-            np.multiply(env_l, (1.0 / 32768.0), out=env_l)
             
             env_r = self._scratch_env_r[:req_size]
             env_r[0::2] = peaks_r
             env_r[1::2] = -peaks_r
-            np.multiply(env_r, (1.0 / 32768.0), out=env_r)
             
             left_scaled = env_l
             right_scaled = env_r
@@ -1224,6 +1219,7 @@ class StreamWorker(QObject):
                     'probesize': str(CONFIG.probesize),
                     'analyzeduration': str(CONFIG.analyzeduration),
                     'timeout': '15000000',      # 15 seconds connection timeout (in microseconds)
+                    'rw_timeout': '15000000',   # 15 seconds read/write stall timeout (in microseconds)
                     'reconnect': '1',           # Enable auto-reconnect
                     'reconnect_at_eof': '1',    # Auto-reconnect at EOF
                     'reconnect_streamed': '1',  # Auto-reconnect streamed
@@ -1391,15 +1387,19 @@ class AudioPlayer(QObject):
             try:
                 if proc.poll() is None: proc.kill()
             except Exception: pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=4.0)
-            if self._thread.is_alive():
-                # Thread ancora vivo dopo timeout: forza kill finale tramite registro globale
-                with self._lock: proc = self._proc
-                if proc:
-                    try: proc.kill(); proc.wait(timeout=1)
-                    except Exception: pass
-            self._thread = None
+        thread_to_join = self._thread
+        self._thread = None
+        if thread_to_join and thread_to_join.is_alive():
+            def _async_join():
+                try:
+                    thread_to_join.join(timeout=2.0)
+                    if thread_to_join.is_alive():
+                        with self._lock: p = self._proc
+                        if p:
+                            try: p.kill(); p.wait(timeout=1)
+                            except Exception: pass
+                except Exception: pass
+            _BG_EXECUTOR.submit(_async_join)
 
     def _run(self):
         # Low-latency flags matching StreamWorker, using CONFIG settings
@@ -1408,6 +1408,7 @@ class AudioPlayer(QObject):
                "-protocol_whitelist", "http,https,tcp,tls,crypto,data",
                "-fflags", "+nobuffer+flush_packets", "-flags", "low_delay",
                "-probesize", str(CONFIG.probesize), "-analyzeduration", str(CONFIG.analyzeduration),
+               "-timeout", "15000000", "-rw_timeout", "15000000",
                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                "-vn", self.url]
         popen_kw = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
@@ -2031,7 +2032,7 @@ class OptionsDialog(QDialog):
         self._email_body.setPlainText(defaults.get("body", "Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n"))
         # Reset alert settings from default file
         self._alerts_enabled_chk.setChecked(bool(defaults.get("silence_alerts_enabled", True)))
-        self._silence_thresh_spin.setValue(int(defaults.get("silence_threshold_lufs", -60)))
+        self._silence_thresh_spin.setValue(int(defaults.get("silence_threshold_lufs", -40)))
         self._alert_mins_spin.setValue(int(defaults.get("silence_alert_mins", 10)))
         self._cooldown_mins_spin.setValue(int(defaults.get("alert_cooldown_mins", 60)))
         self._smtp_enabled_chk.setChecked(bool(defaults.get("smtp_enabled", False)))
