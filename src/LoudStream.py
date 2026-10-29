@@ -721,17 +721,195 @@ TEXT      = "#e0e4f0"
 TEXT_DIM  = "#7a80a0"
 CLOSE_BTN = "#ffffff"
 
-# ── LUFS Calculator ──────────────────────────────────────────────────────────
-_LUFS_METER_CACHE: Dict[int, object] = {}
+# ── Real-Time EBU R128 Audio Analyzer ───────────────────────────────────────
+class AudioAnalyzer:
+    """
+    Real-time DSP Audio Analyzer conforming to EBU R128 / ITU-R BS.1770-4.
+    Computes Short-term (3.0s) and Momentary (400ms) LUFS with O(1) sliding window,
+    monitors continuous silence (< -40 dBFS) with configurable tolerance,
+    and detects dead stream conditions (0 bytes from FFmpeg for > dead_timeout).
+    """
+    _COEFFS = {
+        48000: {
+            "b_hs": np.array([1.53518289, -2.69180403, 1.19842626], dtype=np.float64),
+            "a_hs": np.array([1.0, -1.69069959, 0.73250471], dtype=np.float64),
+            "b_hp": np.array([0.99504430, -1.99008859, 0.99504430], dtype=np.float64),
+            "a_hp": np.array([1.0, -1.99007628, 0.99010090], dtype=np.float64),
+        },
+        44100: {
+            "b_hs": np.array([1.53090959, -2.65116903, 1.16916686], dtype=np.float64),
+            "a_hs": np.array([1.0, -1.66375011, 0.71265753], dtype=np.float64),
+            "b_hp": np.array([0.99460781, -1.98921562, 0.99460781], dtype=np.float64),
+            "a_hp": np.array([1.0, -1.98920104, 0.98923020], dtype=np.float64),
+        },
+    }
 
-def _get_lufs_meter(sample_rate: int):
-    if sample_rate not in _LUFS_METER_CACHE:
-        try:
-            import pyloudnorm as pyln
-            _LUFS_METER_CACHE[sample_rate] = pyln.Meter(sample_rate)
-        except ImportError:
-            _LUFS_METER_CACHE[sample_rate] = None
-    return _LUFS_METER_CACHE[sample_rate]
+    def __init__(
+        self,
+        sample_rate: int = 48000,
+        silence_threshold_lufs: float = -40.0,
+        silence_tolerance_sec: float = 5.0,
+        stream_dead_timeout_sec: float = 3.0,
+    ):
+        self.sample_rate = int(sample_rate)
+        self.silence_threshold_lufs = float(silence_threshold_lufs)
+        self.silence_tolerance_sec = float(silence_tolerance_sec)
+        self.stream_dead_timeout_sec = float(stream_dead_timeout_sec)
+
+        self._frames_momentary = int(0.400 * self.sample_rate)  # 400ms
+        self._frames_shortterm = int(3.000 * self.sample_rate)  # 3.0s
+
+        self._init_filters()
+
+        self._history = deque()
+        self._acc_sum_sq_l = 0.0
+        self._acc_sum_sq_r = 0.0
+        self._acc_total_frames = 0
+
+        self._last_data_time = time.monotonic()
+        self._silence_start_time = None
+        self._last_lufs = -70.0
+        self._last_momentary_lufs = -70.0
+
+    def _init_filters(self):
+        if self.sample_rate in self._COEFFS:
+            coeffs = self._COEFFS[self.sample_rate]
+            self.b_hs = coeffs["b_hs"].copy()
+            self.a_hs = coeffs["a_hs"].copy()
+            self.b_hp = coeffs["b_hp"].copy()
+            self.a_hp = coeffs["a_hp"].copy()
+        else:
+            try:
+                import pyloudnorm as pyln
+                m = pyln.Meter(self.sample_rate)
+                self.b_hs = m._filters['high_shelf'].b.copy()
+                self.a_hs = m._filters['high_shelf'].a.copy()
+                self.b_hp = m._filters['high_pass'].b.copy()
+                self.a_hp = m._filters['high_pass'].a.copy()
+            except Exception:
+                coeffs = self._COEFFS[48000]
+                self.b_hs = coeffs["b_hs"].copy()
+                self.a_hs = coeffs["a_hs"].copy()
+                self.b_hp = coeffs["b_hp"].copy()
+                self.a_hp = coeffs["a_hp"].copy()
+
+        self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+        self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+        self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+        self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+
+    def reset(self):
+        """Reset internal accumulator state for clean reconnection."""
+        self._history.clear()
+        self._acc_sum_sq_l = 0.0
+        self._acc_sum_sq_r = 0.0
+        self._acc_total_frames = 0
+        self._last_data_time = time.monotonic()
+        self._silence_start_time = None
+        self._last_lufs = -70.0
+        self._last_momentary_lufs = -70.0
+        self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+        self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+        self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+        self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+
+    def process_chunk(self, chunk: np.ndarray | bytes, now: float | None = None) -> tuple[float, float, bool, bool]:
+        """
+        Processes stereo PCM chunk (int16 or float32).
+        Returns: (short_term_lufs, momentary_lufs, is_silence, is_stream_dead)
+        """
+        if now is None:
+            now = time.monotonic()
+        self._last_data_time = now
+
+        if isinstance(chunk, bytes):
+            audio = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) * (1.0 / 32768.0)
+            stereo = audio.reshape(-1, 2)
+        elif isinstance(chunk, np.ndarray):
+            if chunk.dtype == np.int16:
+                stereo = chunk.reshape(-1, 2).astype(np.float32) * (1.0 / 32768.0)
+            else:
+                stereo = chunk.reshape(-1, 2).astype(np.float32)
+        else:
+            raise TypeError("Chunk must be bytes or numpy.ndarray")
+
+        n_frames = stereo.shape[0]
+        if n_frames == 0:
+            st, is_sil, is_dead = self.get_status(now)
+            return st, self._last_momentary_lufs, is_sil, is_dead
+
+        # Two-stage stateful K-Weighting
+        fl, self.zi_hs_l = sig.lfilter(self.b_hs, self.a_hs, stereo[:, 0], zi=self.zi_hs_l)
+        fl, self.zi_hp_l = sig.lfilter(self.b_hp, self.a_hp, fl, zi=self.zi_hp_l)
+
+        fr, self.zi_hs_r = sig.lfilter(self.b_hs, self.a_hs, stereo[:, 1], zi=self.zi_hs_r)
+        fr, self.zi_hp_r = sig.lfilter(self.b_hp, self.a_hp, fr, zi=self.zi_hp_r)
+
+        sum_sq_l = float(np.dot(fl, fl))
+        sum_sq_r = float(np.dot(fr, fr))
+
+        self._history.append((sum_sq_l, sum_sq_r, n_frames))
+        self._acc_sum_sq_l += sum_sq_l
+        self._acc_sum_sq_r += sum_sq_r
+        self._acc_total_frames += n_frames
+
+        while self._acc_total_frames - self._history[0][2] >= self._frames_shortterm:
+            old_l, old_r, old_f = self._history.popleft()
+            self._acc_sum_sq_l -= old_l
+            self._acc_sum_sq_r -= old_r
+            self._acc_total_frames -= old_f
+
+        if self._acc_total_frames > 0:
+            ms_l = self._acc_sum_sq_l / self._acc_total_frames
+            ms_r = self._acc_sum_sq_r / self._acc_total_frames
+            lufs = -0.691 + 10.0 * math.log10(ms_l + ms_r + 1e-10)
+            self._last_lufs = max(-70.0, lufs) if math.isfinite(lufs) else -70.0
+        else:
+            self._last_lufs = -70.0
+
+        self._last_momentary_lufs = self._calc_momentary_lufs()
+
+        st, is_sil, is_dead = self.get_status(now)
+        return st, self._last_momentary_lufs, is_sil, is_dead
+
+    def _calc_momentary_lufs(self) -> float:
+        frames_needed = self._frames_momentary
+        sum_l = 0.0
+        sum_r = 0.0
+        frames_counted = 0
+
+        for item in reversed(self._history):
+            sum_l += item[0]
+            sum_r += item[1]
+            frames_counted += item[2]
+            if frames_counted >= frames_needed:
+                break
+
+        if frames_counted > 0:
+            ms_l = sum_l / frames_counted
+            ms_r = sum_r / frames_counted
+            m_lufs = -0.691 + 10.0 * math.log10(ms_l + ms_r + 1e-10)
+            return max(-70.0, m_lufs) if math.isfinite(m_lufs) else -70.0
+        return -70.0
+
+    def get_status(self, now: float | None = None) -> tuple[float, bool, bool]:
+        if now is None:
+            now = time.monotonic()
+
+        is_stream_dead = (now - self._last_data_time) > self.stream_dead_timeout_sec
+        current_lufs = -70.0 if is_stream_dead else self._last_lufs
+
+        is_below_threshold = (current_lufs <= self.silence_threshold_lufs) or is_stream_dead
+        if is_below_threshold:
+            if self._silence_start_time is None:
+                self._silence_start_time = now
+            silence_duration = now - self._silence_start_time
+            is_silence = silence_duration >= self.silence_tolerance_sec
+        else:
+            self._silence_start_time = None
+            is_silence = False
+
+        return current_lufs, is_silence, is_stream_dead
 
 
 # ── Cached FFT constants (computed once, shared by all instances) ──────────
@@ -762,7 +940,12 @@ class StreamWorker(QObject):
         self._thread = None
         
         self.sample_rate = 48000
-        self.has_pyln = False
+        self.analyzer = AudioAnalyzer(
+            sample_rate=self.sample_rate,
+            silence_threshold_lufs=CONFIG.silence_threshold_lufs,
+            silence_tolerance_sec=5.0,
+            stream_dead_timeout_sec=3.0,
+        )
             
         # Waveform ring buffers
         self._waveform_arr_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
@@ -771,11 +954,6 @@ class StreamWorker(QObject):
         
         self._display_l = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
         self._display_r = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
-        
-        # Incremental LUFS deque (maxlen safety net for long-running stability)
-        self._lufs_window_frames = int(LUFS_SHORTTERM_SEC * self.sample_rate)
-        self._lufs_deque = deque(maxlen=200)
-        self._lufs_deque_frames = 0
         
         # Stereo phase correlation (exponential moving average, ~1s time constant)
         self._latest_corr = 0.0
@@ -791,6 +969,9 @@ class StreamWorker(QObject):
         
         # UI cached states
         self._latest_lufs = -999.0
+        self._latest_momentary_lufs = -999.0
+        self._latest_is_silence = False
+        self._latest_is_stream_dead = False
         self._latest_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._latest_spec_r = np.zeros(256, dtype=np.float32) - 80.0
         
@@ -800,7 +981,6 @@ class StreamWorker(QObject):
         
         self._last_ui_emit_time = 0.0
         self._last_spectrum_update = 0.0
-        self._last_lufs_update = 0.0
         self._last_chunk_time = 0.0
         self._fft_updated = False
         
@@ -811,6 +991,9 @@ class StreamWorker(QObject):
         self._ui_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._ui_spec_r = np.zeros(256, dtype=np.float32) - 80.0
         self._ui_lufs = -999.0
+        self._ui_momentary_lufs = -999.0
+        self._ui_is_silence = False
+        self._ui_is_stream_dead = False
         self._ui_corr = 0.0
         self._ui_fft_updated = False
         self._ui_data_dirty = False
@@ -857,34 +1040,14 @@ class StreamWorker(QObject):
             self._raw_write_idx = end_idx % buf_size
             self._raw_filled = min(self._raw_filled + n_frames, buf_size)
             
-        # 2. Stateful K-filtering
-        if self.has_pyln:
-            chunk_f32 = stereo.astype(np.float32) * np.float32(1.0 / 32768.0)
+        # 2. AudioAnalyzer EBU R128 Loudness (Short-Term & Momentary) & Silence / Stream-Dead Detection
+        st_lufs, m_lufs, is_sil, is_dead = self.analyzer.process_chunk(stereo)
+        self._latest_lufs = st_lufs
+        self._latest_momentary_lufs = m_lufs
+        self._latest_is_silence = is_sil
+        self._latest_is_stream_dead = is_dead
             
-            fl, self.zi_hs_l = sig.lfilter(self.b_hs, self.a_hs, chunk_f32[:, 0], zi=self.zi_hs_l)
-            fl, self.zi_hp_l = sig.lfilter(self.b_hp, self.a_hp, fl, zi=self.zi_hp_l)
-            
-            fr, self.zi_hs_r = sig.lfilter(self.b_hs, self.a_hs, chunk_f32[:, 1], zi=self.zi_hs_r)
-            fr, self.zi_hp_r = sig.lfilter(self.b_hp, self.a_hp, fr, zi=self.zi_hp_r)
-            
-            # Avoid expensive np.column_stack by writing to a pre-allocated array view
-            filtered_chunk = np.empty_like(chunk_f32)
-            filtered_chunk[:, 0] = fl
-            filtered_chunk[:, 1] = fr
-        else:
-            filtered_chunk = stereo.astype(np.float32)
-            
-        # 3. Update Moving Window Deque for LUFS
-        sum_sq_l = float(np.dot(filtered_chunk[:, 0], filtered_chunk[:, 0]))
-        sum_sq_r = float(np.dot(filtered_chunk[:, 1], filtered_chunk[:, 1]))
-        self._lufs_deque.append((sum_sq_l, sum_sq_r, n_frames))
-        self._lufs_deque_frames += n_frames
-        
-        while self._lufs_deque_frames - self._lufs_deque[0][2] >= self._lufs_window_frames:
-            popped = self._lufs_deque.popleft()
-            self._lufs_deque_frames -= popped[2]
-            
-        # 4. Stereo Phase Correlation (EMA, ~1s time constant)
+        # 3. Stereo Phase Correlation (EMA, ~1s time constant)
         chunk_l = stereo[:, 0].astype(np.float32)
         chunk_r = stereo[:, 1].astype(np.float32)
         dot_lr = float(np.dot(chunk_l, chunk_r))
@@ -984,29 +1147,7 @@ class StreamWorker(QObject):
             self._latest_spec_l = db_l[self.fft_bin_indices]
             self._latest_spec_r = db_r[self.fft_bin_indices]
             
-        # 6. LUFS update (Throttled: 2 updates per sec)
-        if (current_time - self._last_lufs_update >= LUFS_UPDATE_INTERVAL
-                and self._lufs_deque_frames >= self.sample_rate // 2):
-            self._last_lufs_update = current_time
-            
-            # Sum up deque sum of squares (avoiding O(N) array loops)
-            total_sum_sq_l = 0.0
-            total_sum_sq_r = 0.0
-            total_frames = 0
-            for item in self._lufs_deque:
-                total_sum_sq_l += item[0]
-                total_sum_sq_r += item[1]
-                total_frames += item[2]
-                
-            if total_frames > 0:
-                ms_l = total_sum_sq_l / total_frames
-                ms_r = total_sum_sq_r / total_frames
-                lufs = -0.691 + 10.0 * math.log10(ms_l + ms_r + 1e-10)
-                self._latest_lufs = lufs if math.isfinite(lufs) else -70.0
-            else:
-                self._latest_lufs = -70.0
-
-        # 7. GUI Throttled state update
+        # 5. GUI Throttled state update
         refresh_interval = CONFIG.refresh_ms * 0.001
         if current_time - self._last_ui_emit_time >= refresh_interval:
             self._last_ui_emit_time = current_time
@@ -1024,6 +1165,9 @@ class StreamWorker(QObject):
                 self._ui_spec_l[:] = self._latest_spec_l
                 self._ui_spec_r[:] = self._latest_spec_r
                 self._ui_lufs = self._latest_lufs
+                self._ui_momentary_lufs = self._latest_momentary_lufs
+                self._ui_is_silence = self._latest_is_silence
+                self._ui_is_stream_dead = self._latest_is_stream_dead
                 self._ui_corr = self._latest_corr
                 self._ui_fft_updated = self._fft_updated
                 self._ui_data_dirty = True
@@ -1035,8 +1179,7 @@ class StreamWorker(QObject):
             container = None
             
             # Reset all DSP state for clean reconnection
-            self._lufs_deque.clear()
-            self._lufs_deque_frames = 0
+            self.analyzer.reset()
             self._latest_corr = 0.0
             self._waveform_arr_l[:] = 0
             self._waveform_arr_r[:] = 0
@@ -1045,11 +1188,17 @@ class StreamWorker(QObject):
             self._raw_write_idx = 0
             self._raw_filled = 0
             self._latest_lufs = -999.0
+            self._latest_momentary_lufs = -999.0
+            self._latest_is_silence = False
+            self._latest_is_stream_dead = False
             self._last_chunk_time = 0.0
             self._latest_spec_l[:] = -80.0
             self._latest_spec_r[:] = -80.0
             with self._state_lock:
                 self._ui_lufs = -999.0
+                self._ui_momentary_lufs = -999.0
+                self._ui_is_silence = False
+                self._ui_is_stream_dead = False
                 self._ui_corr = 0.0
                 self._ui_fft_updated = False
                 self._ui_data_dirty = False
@@ -1074,23 +1223,13 @@ class StreamWorker(QObject):
                 
                 # Dynamically match native sample rate to avoid fractional resampling computations
                 self.sample_rate = native_rate
-                self._lufs_window_frames = int(LUFS_SHORTTERM_SEC * native_rate)
-                
-                # Dynamically set up the filter coefficients for this native rate
-                meter = _get_lufs_meter(native_rate)
-                if meter is not None and hasattr(meter, '_filters'):
-                    self.has_pyln = True
-                    self.b_hs = meter._filters['high_shelf'].b.copy()
-                    self.a_hs = meter._filters['high_shelf'].a.copy()
-                    self.b_hp = meter._filters['high_pass'].b.copy()
-                    self.a_hp = meter._filters['high_pass'].a.copy()
-                    
-                    self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
-                    self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
-                    self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
-                    self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
-                else:
-                    self.has_pyln = False
+                if self.analyzer.sample_rate != native_rate:
+                    self.analyzer = AudioAnalyzer(
+                        sample_rate=native_rate,
+                        silence_threshold_lufs=CONFIG.silence_threshold_lufs,
+                        silence_tolerance_sec=5.0,
+                        stream_dead_timeout_sec=3.0,
+                    )
                     
                 # Cache FFT constants for the native rate
                 self.fft_window, self.fft_bin_indices, _ = _get_fft_cache(native_rate, 2048)
@@ -1967,6 +2106,7 @@ class StreamCard(QFrame):
         self._last_alert_attempt_time = None
         self._last_alert_key = ""
         self._current_lufs = -999.0        # unthrottled LUFS reading for accurate alert detection
+        self._current_momentary_lufs = -999.0  # momentary LUFS (400ms window)
         self._healthy_since = None         # debounced recovery tracking
         self._is_visual_alert = False      # tracks if border is highlighted in red alert state
         
@@ -2420,12 +2560,16 @@ class StreamCard(QFrame):
                 self._display_spec_l[:] = worker._ui_spec_l
                 self._display_spec_r[:] = worker._ui_spec_r
                 lufs = worker._ui_lufs
+                m_lufs = worker._ui_momentary_lufs
                 corr = worker._ui_corr
                 fft_updated = worker._ui_fft_updated
                 self._current_lufs = lufs
+                self._current_momentary_lufs = m_lufs
 
-        # Detect stalled stream ("live" socket open, but zero packets decoded for >3 seconds)
+        # Check stream dead condition and silence via AudioAnalyzer
+        st_lufs, is_analyzer_sil, is_analyzer_dead = worker.analyzer.get_status()
         is_stalled = (
+            is_analyzer_dead or
             worker._last_chunk_time == 0.0 or
             (current_time - worker._last_chunk_time) > 3.0
         )
@@ -2603,6 +2747,10 @@ class StreamCard(QFrame):
             self._last_lufs_display = display_lufs
             self._lufs_label.setText(txt)
             self._lufs_bar.setValue(bar_val)
+            m_txt = f"{self._current_momentary_lufs:+.1f} LUFS" if self._current_momentary_lufs > -60 else "—.—"
+            self._lufs_label.setToolTip(
+                f"Short-Term (3s): {txt}\nMomentary (400ms): {m_txt}\nSilence Threshold: {CONFIG.silence_threshold_lufs:.1f} dBFS"
+            )
         if corr_changed:
             self._last_corr_display = corr if lufs > -60 else -999.0
             self._corr_label.setText(corr_txt)
