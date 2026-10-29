@@ -37,7 +37,8 @@ Usage:
     Then add stream URLs from the GUI or write a CSV preset.
 """
 
-import os, sys, threading, subprocess, re, csv, json, time, math, random, smtplib, urllib.parse, atexit, platform, shutil, ctypes, webbrowser, argparse
+import os, sys, threading, subprocess, re, csv, json, time, math, random, smtplib, urllib.parse, atexit, platform, shutil, ctypes, webbrowser, argparse, base64, ssl
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.text import MIMEText
 from email.header import Header
 import scipy.signal as sig
@@ -194,6 +195,100 @@ def _find_binary(name: str) -> str | None:
     return shutil.which(name)
 
 
+# ── Bounded Background Executor (DoS mitigation) ───────────────────────────
+_BG_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="LoudStreamWorker")
+
+def _shutdown_bg_executor():
+    try:
+        _BG_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+atexit.register(_shutdown_bg_executor)
+
+
+# ── Input & Data Sanitization Helpers ───────────────────────────────────────
+def _is_valid_stream_url(url: str) -> bool:
+    """Validate that stream URL has an allowed scheme (http/https) and valid netloc."""
+    if not url or not isinstance(url, str):
+        return False
+    u = url.strip()
+    if any(c in u for c in ('\r', '\n', '\t', '\0')):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(u)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def _sanitize_csv_cell(val: str) -> str:
+    """Neutralize potential CSV formula injection characters (=, +, -, @, tab, cr)."""
+    s = str(val).strip() if val is not None else ""
+    if s and s[0] in ('=', '+', '-', '@', '\t', '\r'):
+        return f"'{s}"
+    return s
+
+
+# ── Credential Security (DPAPI on Windows, keyring / strict chmod fallback) ──
+def _encrypt_secret(plaintext: str) -> str:
+    """Encrypt a secret string using platform secure storage (DPAPI on Windows, keyring if available)."""
+    if not plaintext:
+        return ""
+    if IS_WINDOWS:
+        try:
+            import ctypes.wintypes as _wt
+            class _DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", _wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+            b_data = plaintext.encode("utf-8")
+            blob_in = _DATA_BLOB(len(b_data), ctypes.cast(ctypes.create_string_buffer(b_data), ctypes.POINTER(ctypes.c_byte)))
+            blob_out = _DATA_BLOB()
+            if ctypes.windll.crypt32.CryptProtectData(ctypes.byref(blob_in), "LoudStream SMTP", None, None, None, 0, ctypes.byref(blob_out)):
+                encrypted_bytes = bytes(ctypes.cast(blob_out.pbData, ctypes.POINTER(ctypes.c_byte * blob_out.cbData)).contents)
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                return "dpapi:" + base64.b64encode(encrypted_bytes).decode("ascii")
+        except Exception as e:
+            print(f"[Security] Windows DPAPI protect failed: {e}")
+    try:
+        import keyring
+        keyring.set_password("LoudStream", "smtp_pass", plaintext)
+        return "keyring:stored"
+    except Exception:
+        pass
+    return plaintext
+
+
+def _decrypt_secret(cipher_or_plain: str) -> str:
+    """Decrypt a secret string or load from platform secure storage."""
+    env_pass = os.environ.get("LOUDSTREAM_SMTP_PASS")
+    if env_pass is not None:
+        return env_pass
+    if not cipher_or_plain:
+        return ""
+    if cipher_or_plain.startswith("dpapi:") and IS_WINDOWS:
+        try:
+            import ctypes.wintypes as _wt
+            class _DATA_BLOB(ctypes.Structure):
+                _fields_ = [("cbData", _wt.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
+            raw = base64.b64decode(cipher_or_plain[6:])
+            blob_in = _DATA_BLOB(len(raw), ctypes.cast(ctypes.create_string_buffer(raw), ctypes.POINTER(ctypes.c_byte)))
+            blob_out = _DATA_BLOB()
+            if ctypes.windll.crypt32.CryptUnprotectData(ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+                decrypted_bytes = bytes(ctypes.cast(blob_out.pbData, ctypes.POINTER(ctypes.c_byte * blob_out.cbData)).contents)
+                ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+                return decrypted_bytes.decode("utf-8")
+        except Exception as e:
+            print(f"[Security] Windows DPAPI unprotect failed: {e}")
+            return ""
+    if cipher_or_plain == "keyring:stored":
+        try:
+            import keyring
+            return keyring.get_password("LoudStream", "smtp_pass") or ""
+        except Exception:
+            return ""
+    return cipher_or_plain
+
+
 class _SafeFormatDict(dict):
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
@@ -315,7 +410,8 @@ def _apply_template_data(data: dict):
     CONFIG.smtp_host              = data.get("smtp_host",                CONFIG.smtp_host)
     CONFIG.smtp_port              = int(data.get("smtp_port",            CONFIG.smtp_port))
     CONFIG.smtp_user              = data.get("smtp_user",                CONFIG.smtp_user)
-    CONFIG.smtp_pass              = data.get("smtp_pass",                CONFIG.smtp_pass)
+    raw_pass                      = data.get("smtp_pass",                CONFIG.smtp_pass)
+    CONFIG.smtp_pass              = _decrypt_secret(raw_pass)
     CONFIG.smtp_tls               = data.get("smtp_tls",                 CONFIG.smtp_tls)
     CONFIG.alert_subject          = data.get("alert_subject",            CONFIG.alert_subject)
     CONFIG.alert_body             = data.get("alert_body",               CONFIG.alert_body)
@@ -346,6 +442,7 @@ def _save_email_template():
     """Save current settings to the USER file only. The default file is never modified."""
     try:
         _CUSTOMIZATION_DIR.mkdir(parents=True, exist_ok=True)
+        encrypted_pass = _encrypt_secret(CONFIG.smtp_pass)
         data = {
             "subject":                 CONFIG.email_subject,
             "body":                    CONFIG.email_body,
@@ -358,15 +455,27 @@ def _save_email_template():
             "smtp_host":              CONFIG.smtp_host,
             "smtp_port":              CONFIG.smtp_port,
             "smtp_user":              CONFIG.smtp_user,
-            "smtp_pass":              CONFIG.smtp_pass,
+            "smtp_pass":              encrypted_pass,
             "smtp_tls":               CONFIG.smtp_tls,
             "alert_subject":          CONFIG.alert_subject,
             "alert_body":             CONFIG.alert_body,
             "recovery_subject":       CONFIG.recovery_subject,
             "recovery_body":          CONFIG.recovery_body
         }
-        with open(_EMAIL_TEMPLATE_USER, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        # Save with user-only permissions (0o600) to protect configuration on POSIX
+        user_file_str = str(_EMAIL_TEMPLATE_USER)
+        written = False
+        if not IS_WINDOWS:
+            try:
+                fd = os.open(user_file_str, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with open(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                written = True
+            except OSError:
+                pass
+        if not written:
+            with open(_EMAIL_TEMPLATE_USER, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
         print(f"[Settings] User settings saved to {_EMAIL_TEMPLATE_USER}")
     except Exception as e:
         print(f"[Settings] Could not save user file: {e}")
@@ -437,8 +546,11 @@ class AlertLockManager:
 
 
 # ── Asynchronous Background SMTP Email Dispatcher ────────────────────────────
+_EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$")
+
+
 def send_smtp_email_async(to_email: str, subject: str, body: str, on_complete=None, smtp_config: dict | None = None):
-    """Sends an email in a background daemon thread via SMTP."""
+    """Sends an email in a bounded background executor thread via SMTP with TLS and header sanitization."""
     def _run_smtp():
         cfg = smtp_config or {
             "enabled": CONFIG.smtp_enabled,
@@ -449,39 +561,56 @@ def send_smtp_email_async(to_email: str, subject: str, body: str, on_complete=No
             "tls": CONFIG.smtp_tls,
         }
         raw_parts = re.split(r'[,;]+', to_email) if to_email else []
-        to_emails = list(dict.fromkeys(e.strip() for e in raw_parts if e.strip()))
-        if not cfg["enabled"] or not cfg["host"] or not to_emails:
-            err = "SMTP is disabled or Host / Destination Email is missing"
+        clean_recipients = []
+        for r in raw_parts:
+            # Strip any CRLF to prevent header injection
+            cleaned = re.sub(r'[\r\n]+', '', r).strip()
+            if cleaned and _EMAIL_REGEX.match(cleaned):
+                if cleaned not in clean_recipients:
+                    clean_recipients.append(cleaned)
+            elif cleaned:
+                print(f"[SMTP Warning] Ignored malformed recipient email: '{cleaned}'")
+
+        if not cfg["enabled"] or not cfg["host"] or not clean_recipients:
+            err = "SMTP is disabled or Host / Destination Email is missing or invalid"
             print(f"[SMTP Alert] Skipping dispatch: {err}")
             if on_complete: on_complete(False, err)
             return
 
         try:
+            # Strip CRLF from subject to prevent header injection
+            safe_subject = re.sub(r'[\r\n]+', ' ', subject).strip()
+
             msg = MIMEText(body, 'plain', 'utf-8')
-            msg['Subject'] = Header(subject, 'utf-8')
-            msg['From'] = cfg["user"] or "loudstream-alert@local"
-            msg['To'] = ", ".join(to_emails)
+            msg['Subject'] = Header(safe_subject, 'utf-8')
+            clean_from = re.sub(r'[\r\n]+', '', cfg["user"]).strip() if cfg["user"] else "loudstream-alert@local"
+            msg['From'] = clean_from
+            msg['To'] = ", ".join(clean_recipients)
+
+            ssl_context = ssl.create_default_context()
 
             if cfg["port"] == 465:
-                server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=12)
+                server = smtplib.SMTP_SSL(cfg["host"], cfg["port"], context=ssl_context, timeout=12)
             else:
                 server = smtplib.SMTP(cfg["host"], cfg["port"], timeout=12)
                 if cfg["tls"]:
-                    server.starttls()
+                    server.starttls(context=ssl_context)
+                elif cfg["user"] and cfg["pass"]:
+                    print("[SMTP Warning] Transmitting SMTP credentials over unencrypted connection (TLS disabled)!")
 
             if cfg["user"] and cfg["pass"]:
                 server.login(cfg["user"], cfg["pass"])
 
-            server.sendmail(msg['From'], to_emails, msg.as_string())
+            server.sendmail(msg['From'], clean_recipients, msg.as_string())
             server.quit()
-            print(f"[SMTP Alert] Successfully sent alert email to {', '.join(to_emails)}")
+            print(f"[SMTP Alert] Successfully sent alert email to {', '.join(clean_recipients)}")
             if on_complete: on_complete(True, "Email sent successfully")
         except Exception as e:
             err_msg = f"SMTP error: {e}"
             print(f"[SMTP Alert Error] {err_msg}")
             if on_complete: on_complete(False, err_msg)
 
-    threading.Thread(target=_run_smtp, daemon=True).start()
+    _BG_EXECUTOR.submit(_run_smtp)
 
 
 # ── Metering Standard (LUFS / Phase Correlation coloring) ────────────────────
@@ -665,6 +794,10 @@ class StreamWorker(QObject):
         self._latest_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._latest_spec_r = np.zeros(256, dtype=np.float32) - 80.0
         
+        # Zero-allocation scratch envelope buffers for peak decimation
+        self._scratch_env_l = np.empty(2048, dtype=np.float32)
+        self._scratch_env_r = np.empty(2048, dtype=np.float32)
+        
         self._last_ui_emit_time = 0.0
         self._last_spectrum_update = 0.0
         self._last_lufs_update = 0.0
@@ -779,19 +912,26 @@ class StreamWorker(QObject):
             peaks_l = np.max(tr_l, axis=1)
             peaks_r = np.max(tr_r, axis=1)
             
-            env_l = np.empty(2 * n_blocks, dtype=np.float32)
+            req_size = 2 * n_blocks
+            if req_size > len(self._scratch_env_l):
+                self._scratch_env_l = np.empty(req_size + 512, dtype=np.float32)
+                self._scratch_env_r = np.empty(req_size + 512, dtype=np.float32)
+                
+            env_l = self._scratch_env_l[:req_size]
             env_l[0::2] = peaks_l
             env_l[1::2] = -peaks_l
+            np.multiply(env_l, (1.0 / 32768.0), out=env_l)
             
-            env_r = np.empty(2 * n_blocks, dtype=np.float32)
+            env_r = self._scratch_env_r[:req_size]
             env_r[0::2] = peaks_r
             env_r[1::2] = -peaks_r
-        else:
-            env_l = np.zeros(2, dtype=np.float32)
-            env_r = np.zeros(2, dtype=np.float32)
+            np.multiply(env_r, (1.0 / 32768.0), out=env_r)
             
-        left_scaled = env_l * np.float32(1.0 / 32768.0)
-        right_scaled = env_r * np.float32(1.0 / 32768.0)
+            left_scaled = env_l
+            right_scaled = env_r
+        else:
+            left_scaled = np.zeros(2, dtype=np.float32)
+            right_scaled = np.zeros(2, dtype=np.float32)
         n_new = len(left_scaled)
         w_size = WAVEFORM_HISTORY
         if n_new >= w_size:
@@ -914,7 +1054,7 @@ class StreamWorker(QObject):
                 self._ui_fft_updated = False
                 self._ui_data_dirty = False
             try:
-                # Open the audio stream in-process with timeout and auto-reconnect configuration
+                # Open the audio stream in-process with timeout, auto-reconnect, and strict protocol whitelist
                 container = av.open(self.url, options={
                     'probesize': str(CONFIG.probesize),
                     'analyzeduration': str(CONFIG.analyzeduration),
@@ -922,7 +1062,8 @@ class StreamWorker(QObject):
                     'reconnect': '1',           # Enable auto-reconnect
                     'reconnect_at_eof': '1',    # Auto-reconnect at EOF
                     'reconnect_streamed': '1',  # Auto-reconnect streamed
-                    'reconnect_delay_max': '5'  # Max reconnect retry delay in seconds
+                    'reconnect_delay_max': '5', # Max reconnect retry delay in seconds
+                    'protocol_whitelist': 'http,https,tcp,tls,crypto,data'
                 })
                 
                 if not container.streams.audio:
@@ -1100,6 +1241,7 @@ class AudioPlayer(QObject):
         # Low-latency flags matching StreamWorker, using CONFIG settings
         ffplay_bin = _find_binary("ffplay") or "ffplay"
         cmd = [ffplay_bin, "-nodisp",
+               "-protocol_whitelist", "http,https,tcp,tls,crypto,data",
                "-fflags", "+nobuffer+flush_packets", "-flags", "low_delay",
                "-probesize", str(CONFIG.probesize), "-analyzeduration", str(CONFIG.analyzeduration),
                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
@@ -2345,7 +2487,7 @@ class StreamCard(QFrame):
                         stream_name=stream_name, stream_url=self.url, reason=reason, down_duration=dur_str, time=now_str
                     )
 
-                    # Dispatch via background daemon thread with multi-instance lock & jitter
+                    # Dispatch via bounded background executor with multi-instance lock & jitter
                     def _dispatch_alert_worker():
                         try:
                             time.sleep(random.uniform(0.05, 0.25))
@@ -2358,7 +2500,7 @@ class StreamCard(QFrame):
                         finally:
                             self._alert_in_flight = False
 
-                    threading.Thread(target=_dispatch_alert_worker, daemon=True).start()
+                    _BG_EXECUTOR.submit(_dispatch_alert_worker)
             else:
                 # Stream is live and audio is normal
                 if self._alert_sent and self._last_alert_key:
@@ -2366,7 +2508,9 @@ class StreamCard(QFrame):
                     recipient = ", ".join(filter(None, [self._email, CONFIG.global_alert_email]))
                     now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
-                    AlertLockManager.clear_alert(self._last_alert_key)
+                    # Dispatch lock file clear asynchronously to prevent GUI thread disk I/O lag
+                    key_to_clear = self._last_alert_key
+                    _BG_EXECUTOR.submit(AlertLockManager.clear_alert, key_to_clear)
 
                     subject = _safe_format(
                         CONFIG.recovery_subject,
@@ -2841,8 +2985,10 @@ class MainWindow(QMainWindow):
                 reader = csv.reader(f)
                 rows = []
                 for r in reader:
-                    if len(r) >= 2 and r[1].strip().startswith("http"):
+                    if len(r) >= 2 and _is_valid_stream_url(r[1]):
                         name = r[0].strip()
+                        if name.startswith("'") and len(name) > 1 and name[1] in ('=', '+', '-', '@', '\t', '\r'):
+                            name = name[1:]
                         url = r[1].strip()
                         email = r[2].strip() if len(r) >= 3 else ""
                         rows.append((name, url, email))
@@ -2914,7 +3060,7 @@ class MainWindow(QMainWindow):
                 writer.writerow(["nome", "url", "email"])   # intestazione
                 for card in self._cards:
                     name = card._custom_name or card._name_edit.text().lstrip("⚠").strip()
-                    writer.writerow([name, card.url, card._email])
+                    writer.writerow([_sanitize_csv_cell(name), _sanitize_csv_cell(card.url), _sanitize_csv_cell(card._email)])
             self._refresh_preset_list()
             # Seleziona il preset appena salvato nel combo
             for i in range(self._preset_combo.count()):
@@ -2958,9 +3104,15 @@ class MainWindow(QMainWindow):
         )
         if not ok or not name.strip():
             return
-        # Sanitizza il nome file
-        safe = re.sub(r"[^\w\-. ]", "_", name.strip())
+        # Sanitizza il nome file prevenendo path traversal
+        safe = re.sub(r"[^\w\-. ]", "_", name.strip()).lstrip(". ")
+        if not safe:
+            safe = "preset"
         path = self._preset_dir / f"{safe}.csv"
+        try:
+            path.resolve().relative_to(self._preset_dir.resolve())
+        except ValueError:
+            path = self._preset_dir / "preset.csv"
         self._save_preset_to(path)
 
     def _preset_delete(self):
@@ -2995,9 +3147,9 @@ class MainWindow(QMainWindow):
         if not raw:
             return
 
-        # Split flessibile: newline, virgola, o spazio
+        # Split flessibile: newline, virgola, o spazio con validazione scheme
         candidates = re.split(r"[\n,\s]+", raw)
-        urls = [u.strip() for u in candidates if u.strip().startswith("http")]
+        urls = [u.strip() for u in candidates if _is_valid_stream_url(u.strip())]
 
         if not urls:
             QMessageBox.warning(self, "Invalid URLs", "No HTTP/HTTPS URL detected.")
