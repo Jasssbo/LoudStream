@@ -1102,14 +1102,13 @@ class StreamWorker(QObject):
                     rate=native_rate
                 )
                 
-                self._last_chunk_time = time.time()
-                self._safe_emit(self.status_signal, "live")
                 self._retry_count = 0  # Reset retry counter on successful connection
                 
                 target_size = int(2 * native_rate * 0.1)  # 100ms of stereo samples
                 target_size += target_size % 2
                 acc_buf = np.empty(target_size + 96000, dtype=np.int16)
                 acc_idx = 0
+                first_chunk_received = False
                 
                 # Decode packets and feed samples chunk-by-chunk to the DSP pipeline
                 for packet in container.demux(audio_stream):
@@ -1138,6 +1137,9 @@ class StreamWorker(QObject):
                                 acc_idx += n_s
                                 
                                 if acc_idx >= target_size:
+                                    if not first_chunk_received:
+                                        first_chunk_received = True
+                                        self._safe_emit(self.status_signal, "live")
                                     self._process_chunk(acc_buf[:acc_idx])
                                     acc_idx = 0
                     except av.FFmpegError:
@@ -1965,6 +1967,8 @@ class StreamCard(QFrame):
         self._last_alert_attempt_time = None
         self._last_alert_key = ""
         self._current_lufs = -999.0        # unthrottled LUFS reading for accurate alert detection
+        self._healthy_since = None         # debounced recovery tracking
+        self._is_visual_alert = False      # tracks if border is highlighted in red alert state
         
         # ── Performance: color cache & display values (throttled updates) ──
         self._last_lufs_color  = None      # cached LUFS color (avoid setStyleSheet)
@@ -2315,9 +2319,26 @@ class StreamCard(QFrame):
         colors = {"connecting": YELLOW, "live": GREEN, "stopped": RED}
         self._status_dot.setStyleSheet(f"color: {colors.get(status, GRAY2)};")
         
-        # Unconditionally restore name text & style when connecting/live
-        # (fixes race condition where error_signal fires after status_signal)
-        if status in ("connecting", "live"):
+        if status in ("connecting", "stopped"):
+            self._current_lufs = -999.0
+            self._last_lufs_display = -999.0
+            self._last_corr_display = -999.0
+            self._last_lufs_color = None
+            self._last_corr_color = None
+            lbl_txt = "DOWN" if status == "stopped" else "CONN…"
+            lbl_color = RED if status == "stopped" else YELLOW
+            self._lufs_label.setText(lbl_txt)
+            self._lufs_label.setStyleSheet(f"color: {lbl_color}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
+            self._corr_label.setText("Φ ——")
+            self._lufs_bar.setValue(0)
+            self._curve_l.setData([], skipFiniteCheck=True)
+            self._curve_r.setData([], skipFiniteCheck=True)
+            self._spectrum_curve_l.setData([], skipFiniteCheck=True)
+            self._spectrum_curve_r.setData([], skipFiniteCheck=True)
+            if self._worker:
+                with self._worker._state_lock:
+                    self._worker._ui_data_dirty = False
+        elif status == "live":
             self._in_error = False
             self._refresh_name_display()
             self._name_edit.setToolTip(self.url)
@@ -2349,24 +2370,6 @@ class StreamCard(QFrame):
                     font-size: 11px;
                 }}
             """)
-                
-        if status in ("connecting", "stopped"):
-            # Clear UI curves and reset labels once to avoid CPU rendering on stale data
-            self._curve_l.setData([], skipFiniteCheck=True)
-            self._curve_r.setData([], skipFiniteCheck=True)
-            self._spectrum_curve_l.setData([], skipFiniteCheck=True)
-            self._spectrum_curve_r.setData([], skipFiniteCheck=True)
-            self._lufs_label.setText("LUFS —.—")
-            self._corr_label.setText("Φ ——")
-            self._lufs_bar.setValue(0)
-            self._current_lufs = -999.0
-            self._last_lufs_display = -999.0
-            self._last_corr_display = -999.0
-            self._last_lufs_color = None
-            self._last_corr_color = None
-            if self._worker:
-                with self._worker._state_lock:
-                    self._worker._ui_data_dirty = False
 
     def _on_error(self, msg: str):
         self._in_error = True
@@ -2422,13 +2425,11 @@ class StreamCard(QFrame):
                 self._current_lufs = lufs
 
         # Detect stalled stream ("live" socket open, but zero packets decoded for >3 seconds)
-        if (
-            self._status == "live"
-            and not has_new_data
-            and worker._last_chunk_time > 0
-            and (current_time - worker._last_chunk_time) > 3.0
-            and self._current_lufs > -900.0
-        ):
+        is_stalled = (
+            worker._last_chunk_time == 0.0 or
+            (current_time - worker._last_chunk_time) > 3.0
+        )
+        if self._status == "live" and is_stalled:
             self._current_lufs = -999.0
             self._last_lufs_display = -999.0
             self._last_corr_display = -999.0
@@ -2438,7 +2439,8 @@ class StreamCard(QFrame):
             self._curve_r.setData([], skipFiniteCheck=True)
             self._spectrum_curve_l.setData([], skipFiniteCheck=True)
             self._spectrum_curve_r.setData([], skipFiniteCheck=True)
-            self._lufs_label.setText("LUFS —.—")
+            self._lufs_label.setText("SILENCE")
+            self._lufs_label.setStyleSheet(f"color: {RED}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
             self._corr_label.setText("Φ ——")
             self._lufs_bar.setValue(0)
 
@@ -2446,14 +2448,30 @@ class StreamCard(QFrame):
         # Runs regardless of has_new_data so disconnected streams are monitored continuously.
         if CONFIG.silence_alerts_enabled:
             lufs_for_alert = self._current_lufs  # -999.0 when stream has no valid audio yet
-            is_down = (self._status in ("connecting", "stopped")) or (lufs_for_alert <= CONFIG.silence_threshold_lufs)
+            is_down = (
+                self._status in ("connecting", "stopped") or
+                is_stalled or
+                (lufs_for_alert <= CONFIG.silence_threshold_lufs)
+            )
 
             if is_down:
+                self._healthy_since = None
+                if not self._is_visual_alert:
+                    self._is_visual_alert = True
+                    self.setStyleSheet(f"QFrame#StreamCard {{ background: {BG_CARD}; border: 2px solid {RED}; border-radius: 8px; }}")
+
                 if self._down_start_time is None:
                     self._down_start_time = current_time
-                    self._down_reason = "Stream Disconnected" if self._status in ("connecting", "stopped") else f"Audio Silence (LUFS <= {CONFIG.silence_threshold_lufs:.1f} dBFS)"
+                    if self._status in ("connecting", "stopped"):
+                        self._down_reason = "Stream Disconnected"
+                    elif is_stalled:
+                        self._down_reason = "Stream Stalled (No Audio Packets)"
+                    else:
+                        self._down_reason = f"Audio Silence (LUFS <= {CONFIG.silence_threshold_lufs:.1f} dBFS)"
                 elif self._status in ("connecting", "stopped"):
                     self._down_reason = "Stream Disconnected"
+                elif is_stalled:
+                    self._down_reason = "Stream Stalled (No Audio Packets)"
 
                 down_duration_sec = current_time - self._down_start_time
                 threshold_sec = CONFIG.silence_alert_mins * 60.0
@@ -2502,33 +2520,42 @@ class StreamCard(QFrame):
 
                     _BG_EXECUTOR.submit(_dispatch_alert_worker)
             else:
-                # Stream is live and audio is normal
-                if self._alert_sent and self._last_alert_key:
-                    stream_name = self._custom_name or self._short_url()
-                    recipient = ", ".join(filter(None, [self._email, CONFIG.global_alert_email]))
-                    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+                # Stream is receiving valid audio above silence threshold
+                if self._healthy_since is None:
+                    self._healthy_since = current_time
 
-                    # Dispatch lock file clear asynchronously to prevent GUI thread disk I/O lag
-                    key_to_clear = self._last_alert_key
-                    _BG_EXECUTOR.submit(AlertLockManager.clear_alert, key_to_clear)
+                # Require 3.0s of continuous healthy audio before declaring full recovery
+                if (current_time - self._healthy_since) >= 3.0:
+                    if self._is_visual_alert:
+                        self._is_visual_alert = False
+                        self.setStyleSheet(f"QFrame#StreamCard {{ background: {BG_CARD}; border: 1px solid {GRAY}; border-radius: 8px; }}")
 
-                    subject = _safe_format(
-                        CONFIG.recovery_subject,
-                        stream_name=stream_name, stream_url=self.url, time=now_str
-                    )
-                    body = _safe_format(
-                        CONFIG.recovery_body,
-                        stream_name=stream_name, stream_url=self.url, time=now_str
-                    )
+                    if self._alert_sent and self._last_alert_key:
+                        stream_name = self._custom_name or self._short_url()
+                        recipient = ", ".join(filter(None, [self._email, CONFIG.global_alert_email]))
+                        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
-                    print(f"[Recovery Triggered] Stream '{stream_name}' RECOVERED. Dispatching SMTP recovery email...")
-                    send_smtp_email_async(recipient, subject, body)
+                        # Dispatch lock file clear asynchronously to prevent GUI thread disk I/O lag
+                        key_to_clear = self._last_alert_key
+                        _BG_EXECUTOR.submit(AlertLockManager.clear_alert, key_to_clear)
 
-                self._alert_sent = False
-                self._alert_in_flight = False
-                self._last_alert_attempt_time = None
-                self._last_alert_key = ""
-                self._down_start_time = None
+                        subject = _safe_format(
+                            CONFIG.recovery_subject,
+                            stream_name=stream_name, stream_url=self.url, time=now_str
+                        )
+                        body = _safe_format(
+                            CONFIG.recovery_body,
+                            stream_name=stream_name, stream_url=self.url, time=now_str
+                        )
+
+                        print(f"[Recovery Triggered] Stream '{stream_name}' RECOVERED. Dispatching SMTP recovery email...")
+                        send_smtp_email_async(recipient, subject, body)
+
+                    self._alert_sent = False
+                    self._alert_in_flight = False
+                    self._last_alert_attempt_time = None
+                    self._last_alert_key = ""
+                    self._down_start_time = None
 
         if not has_new_data:
             return
@@ -2545,8 +2572,14 @@ class StreamCard(QFrame):
 
         # ── LUFS & Correlation display ──
         # LUFS display values
-        if lufs <= -60:
-            txt, bar_val, color = "LUFS —.—", 0, TEXT_DIM
+        if lufs <= CONFIG.silence_threshold_lufs or lufs <= -60:
+            if lufs <= -60:
+                txt = "LUFS —.—"
+                color = TEXT_DIM
+            else:
+                txt = f"SILENCE ({lufs:+.0f})"
+                color = RED
+            bar_val = 0
             display_lufs = -70.0
         else:
             txt = f"LUFS {lufs:+.1f}"
@@ -2563,7 +2596,7 @@ class StreamCard(QFrame):
             corr_txt = f"Φ {corr:+.2f}"
 
         # Throttle updates: only write when value changes
-        lufs_changed = abs(display_lufs - self._last_lufs_display) >= 0.2
+        lufs_changed = abs(display_lufs - self._last_lufs_display) >= 0.2 or self._lufs_label.text() != txt
         corr_changed = abs(corr - self._last_corr_display) >= 0.05 or (lufs <= -60 and self._last_corr_display != -999.0)
 
         if lufs_changed:
