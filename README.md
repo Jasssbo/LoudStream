@@ -214,12 +214,12 @@ You can build the executable from either the `Windows/` folder or the repository
 ```powershell
 pip install pyinstaller
 
-# Option A: From inside the Windows directory
-cd Windows
-pyinstaller LoudStream.spec
+```powershell
+# On Windows PowerShell
+pip install pyinstaller
 
-# Option B: Directly from the repository root
-pyinstaller Windows/LoudStream.spec
+# Run the build from the Windows directory
+cd Windows && pyinstaller LoudStream.spec
 ```
 
 The executable will be generated in `dist/LoudStream/LoudStream.exe`. Inno Setup automatically detects the build output in either `Windows/dist` or root `dist`.
