@@ -209,13 +209,20 @@ Core dependencies in [`src/requirements.txt`](src/requirements.txt):
 
 ### Creating the Executable with PyInstaller (Optional)
 
-```bash
+You can build the executable from either the `Windows/` folder or the repository root:
+
+```powershell
 pip install pyinstaller
+
+# Option A: From inside the Windows directory
 cd Windows
 pyinstaller LoudStream.spec
+
+# Option B: Directly from the repository root
+pyinstaller Windows/LoudStream.spec
 ```
 
-The executable will be generated in `Windows/dist/LoudStream/LoudStream.exe`.
+The executable will be generated in `dist/LoudStream/LoudStream.exe`. Inno Setup automatically detects the build output in either `Windows/dist` or root `dist`.
 
 ---
 

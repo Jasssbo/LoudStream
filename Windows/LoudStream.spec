@@ -1,12 +1,25 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 
+# Resolves paths relative to this spec file regardless of terminal execution directory
+spec_dir = os.path.abspath(SPECPATH)
+project_root = os.path.abspath(os.path.join(spec_dir, ".."))
 
 a = Analysis(
-    ['../src/LoudStream.py'],
-    pathex=[],
+    [os.path.join(project_root, 'src', 'LoudStream.py')],
+    pathex=[project_root],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[
+        (os.path.join(project_root, 'src', 'customization'), 'customization'),
+        (os.path.join(spec_dir, 'icons'), 'icons'),
+    ],
+    hiddenimports=[
+        'smtplib',
+        'ssl',
+        'email.mime.text',
+        'email.header',
+        'ctypes.wintypes',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +35,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='LoudStream',
-    icon=r'./icons/LoudStream.ico',
+    icon=os.path.join(spec_dir, 'icons', 'LoudStream.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

@@ -356,7 +356,19 @@ CONFIG = StreamConfig()
 
 
 # ── Customization directory (presets, standards, email template) ────────────
-_BUNDLED_CUSTOMIZATION_DIR = _BASE_DIR / "customization"
+def _find_bundled_customization_dir() -> Path:
+    """Locate the read-only bundled customization directory across source, installed, or frozen setups."""
+    candidates = [_BASE_DIR / "customization"]
+    if getattr(sys, 'frozen', False):
+        if hasattr(sys, '_MEIPASS'):
+            candidates.append(Path(sys._MEIPASS) / "customization")
+        candidates.append(_BASE_DIR / "_internal" / "customization")
+    for c in candidates:
+        if c.exists():
+            return c
+    return _BASE_DIR / "customization"
+
+_BUNDLED_CUSTOMIZATION_DIR = _find_bundled_customization_dir()
 
 
 def _resolve_customization_dir() -> Path:
@@ -649,6 +661,7 @@ def _resolve_metering_standards_file() -> Path:
         _CUSTOMIZATION_DIR / "metering_standards" / "standards.json",
         _BUNDLED_CUSTOMIZATION_DIR / "metering_standards" / "standards.json",
         _BASE_DIR / "metering_standards" / "standards.json",
+        _BASE_DIR / "_internal" / "customization" / "metering_standards" / "standards.json",
     ):
         if candidate.exists():
             return candidate
@@ -3594,6 +3607,7 @@ def main():
 
     for icon_candidate in (
         _BASE_DIR / "icons" / "LoudStream.ico",
+        _BASE_DIR / "_internal" / "icons" / "LoudStream.ico",
         _BASE_DIR / "LoudStream.ico",
         _BASE_DIR.parent / "LoudStream.ico",
     ):

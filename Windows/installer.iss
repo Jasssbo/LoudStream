@@ -4,10 +4,17 @@
 #define MyAppExeName "LoudStream.exe"
 
 ; {#SourcePath} è automatico — Inno Setup lo risolve da solo
-; basta che dist\ e ffmpeg_bin\ siano nella stessa cartella del .iss
-#define SourceApp SourcePath + "dist\LoudStream"
+; Rileva automaticamente se 'dist\LoudStream' si trova in 'Windows\dist' oppure nella root del repository '..\dist'
+#if DirExists(SourcePath + "dist\LoudStream")
+  #define SourceApp SourcePath + "dist\LoudStream"
+#elif DirExists(SourcePath + "..\dist\LoudStream")
+  #define SourceApp SourcePath + "..\dist\LoudStream"
+#else
+  #define SourceApp SourcePath + "dist\LoudStream"
+#endif
+
 #define SourceFfmpeg SourcePath + "ffmpeg_bin"
-#define SourceIcons SourcePath + "\icons"
+#define SourceIcons SourcePath + "icons"
 
 [Setup]
 AppId={{B73015F5-B54B-41C0-AAD1-7748A105639C}

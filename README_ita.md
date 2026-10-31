@@ -208,13 +208,20 @@ Dipendenze principali contenute in [`src/requirements.txt`](src/requirements.txt
 
 ### Creazione dell'Eseguibile con PyInstaller (Opzionale)
 
-```bash
+È possibile compilare l'eseguibile sia dalla cartella `Windows/` che direttamente dalla root del progetto:
+
+```powershell
 pip install pyinstaller
+
+# Opzione A: Dalla cartella Windows
 cd Windows
 pyinstaller LoudStream.spec
+
+# Opzione B: Direttamente dalla root del repository
+pyinstaller Windows/LoudStream.spec
 ```
 
-L'eseguibile compilato verrà salvato in `Windows/dist/LoudStream/LoudStream.exe`.
+L'eseguibile compilato verrà salvato in `dist/LoudStream/LoudStream.exe`. Lo script di Inno Setup (`installer.iss`) rileva automaticamente la cartella `dist` in entrambe le posizioni (`Windows/dist` oppure `dist` nella root).
 
 ---
 
