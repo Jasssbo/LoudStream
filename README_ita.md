@@ -8,7 +8,7 @@ Monitora fino a 16 stream audio simultaneamente con visualizzazione in tempo rea
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)
 ![EBU R128](https://img.shields.io/badge/Standard-EBU%20R128%20%2F%20ITU--R%20BS.1770--4-blueviolet.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+![License](https://img.shields.io/badge/License-GPLv3-blue.svg)
 
 ---
 
@@ -245,8 +245,8 @@ L'installer autoinstallante verrà generato in `Windows/Output/`.
 
 ## Licenza
 
-Questo progetto è distribuito sotto licenza **MIT**. Consulta il file [LICENSE](LICENSE) per tutti i dettagli.  
-Libero da usare, modificare e distribuire — anche in contesti commerciali e radiofonici professionali.
+Questo progetto è distribuito con licenza **GNU General Public License v3.0 (GPLv3)**. Consulta il file [LICENSE](LICENSE) per tutti i dettagli.  
+Software libero: puoi redistribuirlo e/o modificarlo secondo i termini della GNU General Public License pubblicata dalla Free Software Foundation.
 
 ---
 
